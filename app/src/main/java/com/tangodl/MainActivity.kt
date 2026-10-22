@@ -15,6 +15,7 @@ import android.graphics.drawable.GradientDrawable
 import android.media.MediaCodec
 import android.media.MediaExtractor
 import android.media.MediaFormat
+import android.media.MediaMetadataRetriever
 import android.media.MediaMuxer
 import android.net.Uri
 import android.os.Build
@@ -23,7 +24,9 @@ import android.os.Environment
 import android.os.Handler
 import android.os.Looper
 import android.provider.MediaStore
+import android.text.Editable
 import android.text.InputType
+import android.text.TextWatcher
 import android.text.TextUtils
 import android.view.Gravity
 import android.view.KeyEvent
@@ -41,6 +44,11 @@ import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
 import android.webkit.WebView
 import android.webkit.WebViewClient
+import android.webkit.ValueCallback
+import android.webkit.PermissionRequest
+import android.webkit.GeolocationPermissions
+import android.webkit.URLUtil
+import android.widget.SeekBar
 import android.widget.Button
 import android.widget.EditText
 import android.widget.FrameLayout
@@ -84,11 +92,28 @@ class MainActivity : Activity() {
 
     private val ui = Handler(Looper.getMainLooper())
     private val found = LinkedHashSet<String>()
-    private val queue = Executors.newFixedThreadPool(2)
+    private val queue = java.util.concurrent.ThreadPoolExecutor(2, 2, 30L, java.util.concurrent.TimeUnit.SECONDS, java.util.concurrent.LinkedBlockingQueue<Runnable>())
+    @Volatile private var limitKb = 0
+    private val thrLock = Any()
+    private var thrNext = 0L
     private val pages = java.util.concurrent.ConcurrentHashMap<WebView, String>()
     private val tabs = ArrayList<Tab>()
     private var cur: Tab? = null
     private var page = 0
+    private var fileCb: ValueCallback<Array<Uri>>? = null
+    private var geoCb: GeolocationPermissions.Callback? = null
+    private var geoOrigin = ""
+    private var permReq: PermissionRequest? = null
+    private var fullView: View? = null
+    private var fullCb: WebChromeClient.CustomViewCallback? = null
+    private var fullFlags = 0
+    private val foundName = HashMap<String, String>()
+    private val foundMime = HashMap<String, String>()
+    private val sizeIds = LinkedHashMap<String, Pair<String, String>>()
+    private val noIconIds = hashSetOf("txt_pill")
+    private lateinit var barBack: ImageView
+    private lateinit var barFwd: ImageView
+    private lateinit var barTabs: FrameLayout
 
     @Volatile private var adBlock = true
     @Volatile private var curUa = ""
@@ -127,12 +152,139 @@ class MainActivity : Activity() {
     private lateinit var tabBtn: TextView
     private lateinit var activeBox: LinearLayout
     private lateinit var activeTitle: TextView
+    private lateinit var activeEmpty: TextView
 
     // بدء تحميل كل رابط ملتقط وهيدرزه (لأزرار الفيديو داخل الصفحة)
     private val foundStart = HashMap<String, () -> Unit>()
     private val foundHdr = HashMap<String, Map<String, String>>()
     private val imgPool = Executors.newFixedThreadPool(2)
-    private class Variant(val label: String, val url: String)
+    private class Variant(val label: String, val url: String, val bw: Long = 0L, val res: String = "")
+
+    // معلومات الفيديو الملتقط: مسجل (VOD) أم بث مباشر، المدة، الحجم، أعلى جودة، وروابط الجودات الفرعية
+    private data class Meta(val vod: Boolean, val dur: Double, val size: Long, val sizeEst: Boolean, val res: String, val kbps: Long, val subs: List<String>, val conf: Int = 100, val why: String = "")
+    private class Cand(val url: String, val owner: Tab?, var meta: Meta?, var title: String, val rw: Row, val view: View, val info: TextView, val hostTxt: String, val pageTitle: String)
+    private val segUrls = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+    private val hlsSet = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+    private val previewPool = Executors.newSingleThreadExecutor()
+    private val cands = LinkedHashMap<String, Cand>()
+    private val considered = HashSet<String>()
+    private val capLog = java.util.ArrayList<String>()
+
+    // ---- تصنيف مسجل/مباشر اليدوي ----
+    private class Excl(val u: String, val h: Map<String, String>, val meta: Meta?, val owner: Tab?, val title: String)
+    private val excluded = java.util.concurrent.ConcurrentHashMap<String, Excl>()
+
+    private fun ovrKey(u: String): String { val x = Uri.parse(u); return (x.host ?: "") + (x.path ?: "") }
+
+    // true = مسجل، false = بث مباشر، null = لا تصنيف يدوي (الأولوية للرابط ثم للموقع)
+    private fun getOvr(u: String): Boolean? {
+        val set = prefs().getStringSet("ovr", emptySet()) ?: emptySet()
+        val k = ovrKey(u)
+        val host = Uri.parse(u).host ?: ""
+        if (set.contains("vod|" + k)) return true
+        if (set.contains("live|" + k)) return false
+        if (set.contains("hvod|" + host)) return true
+        if (set.contains("hlive|" + host)) return false
+        return null
+    }
+
+    // scope: "url" لهذا الرابط، "host" لكل روابط الموقع. vod = null يزيل التصنيف اليدوي
+    private fun setOvr(u: String, scope: String, vod: Boolean?) {
+        val set = HashSet(prefs().getStringSet("ovr", emptySet()) ?: emptySet())
+        val k = ovrKey(u)
+        val host = Uri.parse(u).host ?: ""
+        if (vod == null) {
+            set.remove("vod|" + k); set.remove("live|" + k); set.remove("hvod|" + host); set.remove("hlive|" + host)
+        } else if (scope == "host") {
+            set.remove("hvod|" + host); set.remove("hlive|" + host)
+            set.add((if (vod) "hvod|" else "hlive|") + host)
+        } else {
+            set.remove("vod|" + k); set.remove("live|" + k)
+            set.add((if (vod) "vod|" else "live|") + k)
+        }
+        prefs().edit().putStringSet("ovr", set).apply()
+    }
+
+    private fun applyVerdict(c: Cand, vod: Boolean) {
+        val m = c.meta ?: Meta(vod, -1.0, -1L, false, "", 0L, emptyList())
+        c.meta = m.copy(vod = vod, conf = 100, why = "يدوي")
+        refreshInfo(c)
+        if (!vod && !prefs().getBoolean("showlive", true)) {
+            excluded[c.url] = Excl(c.url, foundHdr[c.url] ?: emptyMap(), c.meta, c.owner, c.pageTitle)
+            dropCand(c)
+            updateCounts()
+        }
+    }
+
+    private fun classifyDialog(c: Cand) {
+        val labels = arrayOf("مسجل (هذا الرابط)", "بث مباشر (هذا الرابط)", "كل روابط هذا الموقع مسجلة", "كل روابط هذا الموقع بث مباشر", "إزالة التصنيف اليدوي")
+        AlertDialog.Builder(this).setTitle("تصنيف الفيديو").setItems(labels) { _, i ->
+            val u = c.url
+            when (i) {
+                0 -> { setOvr(u, "url", true); applyVerdict(c, true) }
+                1 -> { setOvr(u, "url", false); applyVerdict(c, false) }
+                2 -> {
+                    setOvr(u, "host", true)
+                    for (x in ArrayList(cands.values)) if (x.hostTxt == c.hostTxt) applyVerdict(x, true)
+                }
+                3 -> {
+                    setOvr(u, "host", false)
+                    for (x in ArrayList(cands.values)) if (x.hostTxt == c.hostTxt) applyVerdict(x, false)
+                }
+                else -> { setOvr(u, "url", null); toast("أُزيل التصنيف اليدوي، يُحكم على الرابط تلقائياً عند التقاطه ثانية") }
+            }
+            capNote("يدوي", u, "صُنّف: " + labels[i])
+        }.setNegativeButton("إغلاق", null).show()
+    }
+
+    // الروابط التي استبعدها التطبيق لأنها بدت بثاً مباشراً: تظهر هنا لتصحح الحكم يدوياً
+    private fun excludedDialog() {
+        val items = ArrayList(excluded.values).reversed()
+        if (items.isEmpty()) { toast("لا توجد روابط مستبعدة"); return }
+        val labels = items.map {
+            (if (it.title.isNotBlank()) it.title.take(40) else "فيديو") + "\n" + (Uri.parse(it.u).host ?: "") +
+                (it.meta?.let { m -> " • " + (if (m.vod) "مسجل" else "بث") + " " + m.conf + "% • " + m.why } ?: "")
+        }.toTypedArray()
+        AlertDialog.Builder(this).setTitle("الروابط المستبعدة (" + items.size + ")").setItems(labels) { _, i ->
+            val e = items[i]
+            val acts = arrayOf("اعتباره مسجلاً وإضافته", "اعتبار كل روابط هذا الموقع مسجلة", "نسخ الرابط")
+            AlertDialog.Builder(this).setTitle("ماذا تريد؟").setItems(acts) { _, k ->
+                if (k == 2) { copyText(e.u); return@setItems }
+                setOvr(e.u, if (k == 1) "host" else "url", true)
+                val targets = if (k == 1) items.filter { (Uri.parse(it.u).host ?: "") == (Uri.parse(e.u).host ?: "") } else listOf(e)
+                for (x in targets) {
+                    excluded.remove(x.u)
+                    val base = x.meta ?: Meta(true, -1.0, -1L, false, "", 0L, emptyList())
+                    addFound(x.u, x.h, base.copy(vod = true, conf = 100, why = "يدوي"), x.owner, x.title)
+                }
+                updateCounts()
+                toast("أُضيف إلى التحميلات")
+            }.show()
+        }.setNegativeButton("إغلاق", null).show()
+    }
+    private fun capNote(kind: String, u: String, why: String) {
+        val line = java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.US).format(java.util.Date()) + "  [" + kind + "]  " + why + "\n" + u.take(220)
+        synchronized(capLog) { capLog.add(line); val lc = prefs().getInt("logcap", 0); while (lc > 0 && capLog.size > lc) capLog.removeAt(0) }
+    }
+    private fun showCapLog() {
+        val all = synchronized(capLog) { if (capLog.isEmpty()) "لا توجد سجلات بعد. افتح صفحة فيها فيديوهات ثم عد هنا." else capLog.asReversed().joinToString("\n\n") }
+        val ls = prefs().getInt("logshow", 0)
+        val txt = if (ls > 0) all.split("\n\n").take(ls).joinToString("\n\n") else all
+        AlertDialog.Builder(this).setTitle("سجل الالتقاط (لماذا ظهر الرابط أو أُهمل)").setMessage(txt)
+            .setPositiveButton("نسخ") { _, _ -> copyText(all) }
+            .setNeutralButton("مسح") { _, _ -> synchronized(capLog) { capLog.clear() } }
+            .setNegativeButton("إغلاق", null).show()
+    }
+    private val subUrls = HashSet<String>()
+    private val analyzer = java.util.concurrent.ThreadPoolExecutor(16, 16, 30L, java.util.concurrent.TimeUnit.SECONDS, java.util.concurrent.LinkedBlockingQueue<Runnable>()).also { it.allowCoreThreadTimeOut(true) }
+    private lateinit var dlFab: TextView
+    private lateinit var startView: ScrollView
+    private lateinit var startSites: LinearLayout
+    private lateinit var startBm: LinearLayout
+    private lateinit var startBox: EditText
+    private lateinit var findBar: LinearLayout
+    private lateinit var findBox: EditText
+    private lateinit var findCount: TextView
 
     private class Ctl {
         @Volatile var cancelled = false
@@ -140,7 +292,12 @@ class MainActivity : Activity() {
         val bytes = java.util.concurrent.atomic.AtomicLong(0)
     }
     private class CancelledException : Exception("أُلغي التحميل")
-    private class Row(val bar: ProgressBar, val msg: TextView, val btn: View, val pause: TextView, val cancel: TextView, val ctl: Ctl, val view: View)
+    private class Row(val bar: ProgressBar, val msg: TextView, val btn: View, val pause: TextView, val cancel: TextView, val ctl: Ctl, val view: View) {
+        var work: File? = null
+        var finalLoc: String? = null
+        var finalIsUri = false
+        var watch: View? = null
+    }
 
     // يوقف الخيط أثناء الإيقاف المؤقت ويرمي استثناء عند الإلغاء
     private fun gate(c: Ctl) {
@@ -166,13 +323,20 @@ class MainActivity : Activity() {
         (r.view.parent as? ViewGroup)?.removeView(r.view)
         if (on) activeBox.addView(r.view, 0, lp(MATCH, WRAP, 0f, 0, 0, 0, 10))
         else list.addView(r.view, 0, lp(MATCH, WRAP, 0f, 0, 0, 0, 10))
-        activeTitle.visibility = if (activeBox.childCount > 0) View.VISIBLE else View.GONE
         updateCounts()
     }
 
     private fun saver() = prefs().getBoolean("saver", false)
     private fun lowQ() = saver() || prefs().getString("quality", "high") == "low"
-    private fun baseCache() = if (saver()) WebSettings.LOAD_CACHE_ELSE_NETWORK else WebSettings.LOAD_DEFAULT
+    private fun pageCache() = prefs().getBoolean("cachepages", true)
+    private fun baseCache() = if (saver() || pageCache()) WebSettings.LOAD_CACHE_ELSE_NETWORK else WebSettings.LOAD_DEFAULT
+
+    // تحديث حقيقي من الإنترنت (يتجاهل النسخة المخزنة مرة واحدة ثم يعود للوضع المعتاد بعد انتهاء التحميل)
+    private fun hardReload(t: Tab) {
+        t.restoring = true
+        t.web.settings.cacheMode = WebSettings.LOAD_NO_CACHE
+        t.web.reload()
+    }
 
     // الصفحات المغلقة مؤخراً (حالة محفوظة على القرص)
     private class Closed(val id: String, val title: String, val url: String)
@@ -184,7 +348,9 @@ class MainActivity : Activity() {
         "criteo", "adcolony", "vungle", "chartboost", "ironsrc", "adjust.com", "appsflyer"
     )
 
-    inner class Tab(val web: WebView) {
+    inner class Tab(var web: WebView) {
+        var pendingUrl: String? = null
+        var lastCrash = 0L
         lateinit var chip: LinearLayout
         lateinit var label: TextView
         lateinit var close: ImageView
@@ -193,6 +359,9 @@ class MainActivity : Activity() {
         var title = ""
         var restoring = false
         var injected = false
+        var lastUrl = ""
+        var start = false
+        var scanning = false
     }
 
     // ---------- أدوات مساعدة للواجهة ----------
@@ -230,10 +399,23 @@ class MainActivity : Activity() {
     private fun pill(text: String, filled: Boolean, onClick: () -> Unit): TextView {
         val t = tv(text, 13f, Color.WHITE, true)
         t.gravity = Gravity.CENTER
-        t.setPadding(dp(14), dp(8), dp(14), dp(8))
+        t.tag = "pill"
+        applyPillSize(t)
         styleChip(t, filled)
         t.setOnClickListener { onClick() }
         return t
+    }
+
+    // حجم الأزرار النصية (تحميل، نسخ الرابط، إلغاء...) يتبع شريط «الأزرار النصية» في الأحجام
+    private fun applyPillSize(t: TextView) {
+        val p = pctB("txt_pill")
+        t.textSize = (13f * p / 100f).coerceIn(7f, 30f)
+        t.setPadding(dp(14 * p / 100), dp(8 * p / 100), dp(14 * p / 100), dp(8 * p / 100))
+    }
+
+    private fun restylePills(v: View) {
+        if (v is TextView && v.tag == "pill") applyPillSize(v)
+        if (v is ViewGroup) for (i in 0 until v.childCount) restylePills(v.getChildAt(i))
     }
 
     private fun iconBtn(res: Int, tint: Int = cText, onClick: () -> Unit): ImageView {
@@ -288,6 +470,7 @@ class MainActivity : Activity() {
 
     override fun onCreate(b: Bundle?) {
         super.onCreate(b)
+        applyPools()
         val prevH = Thread.getDefaultUncaughtExceptionHandler()
         Thread.setDefaultUncaughtExceptionHandler { th, e ->
             try {
@@ -303,6 +486,10 @@ class MainActivity : Activity() {
         }
         dark = prefs().getBoolean("dark", true)
         adBlock = prefs().getBoolean("adblock", true)
+        limitKb = prefs().getInt("limitkb", 0)
+        Thread { rcTrim() }.start()
+        applyParallel()
+        regStatic()
         initColors()
         window.statusBarColor = cBar
         window.navigationBarColor = cBar
@@ -344,7 +531,7 @@ class MainActivity : Activity() {
             val ci = b?.getInt("cur", 0) ?: 0
             if (ci in tabs.indices) switchTo(tabs[ci])
         } else {
-            newTab(prefs().getString("home", HOME) ?: HOME)
+            newHomeTab()
         }
     }
 
@@ -361,12 +548,49 @@ class MainActivity : Activity() {
         CookieManager.getInstance().flush() // يحفظ تسجيل الدخول
     }
 
+    override fun onTrimMemory(level: Int) {
+        super.onTrimMemory(level)
+        if (level >= android.content.ComponentCallbacks2.TRIM_MEMORY_RUNNING_LOW) {
+            for (t in tabs) if (t !== cur) try { t.web.clearCache(false) } catch (e: Throwable) {}
+        }
+    }
+
+    override fun onLowMemory() {
+        super.onLowMemory()
+        // تحرير ذاكرة التبويبات المخفية عند ضغط الذاكرة
+        for (t in tabs) if (t !== cur) try { t.web.freeMemory() } catch (e: Throwable) {}
+    }
+
+    override fun onDestroy() {
+        ui.removeCallbacksAndMessages(null)
+        for (t in ArrayList(tabs)) {
+            try { container.removeView(t.web) } catch (e: Throwable) {}
+            try { t.web.destroy() } catch (e: Throwable) {}
+        }
+        pages.clear()
+        try { prober.shutdownNow() } catch (e: Throwable) {}
+        super.onDestroy()
+    }
+
     override fun onBackPressed() {
+        if (fullView != null) {
+            hideFull()
+            return
+        }
         if (page != 0) {
             showPage(0)
             return
         }
+        if (findBar.visibility == View.VISIBLE) {
+            closeFind()
+            return
+        }
         val t = cur
+        if (t != null && t.start && t.web.url != null) {
+            t.start = false
+            updateStart()
+            return
+        }
         if (t != null && t.web.canGoBack()) t.web.goBack() else super.onBackPressed()
     }
 
@@ -389,14 +613,19 @@ class MainActivity : Activity() {
             Triple(R.drawable.ic_alert, "التنبيهات", 4)
         )
         for ((ic, label, idx) in defs) {
+            val id = "nav_" + idx
+            val pb = pctB(id)
+            val pi = pctI(id)
             val item = LinearLayout(this)
             item.orientation = LinearLayout.VERTICAL
-            item.gravity = Gravity.CENTER_HORIZONTAL
-            item.setPadding(0, dp(7), 0, dp(7))
+            item.gravity = Gravity.CENTER
+            item.minimumHeight = dp(54 * pb / 100)
+            item.setPadding(0, dp(7 * pb / 100), 0, dp(7 * pb / 100))
             val im = ImageView(this)
             im.setImageResource(ic)
-            val t = tv(label, 11f, cMuted)
-            item.addView(im, lp(dp(24), dp(24)))
+            val t = tv(label, (11f * pb / 100f).coerceIn(7f, 16f), cMuted)
+            val isz = minOf(dp(24 * pi / 100), resources.displayMetrics.widthPixels / 5 - dp(4))
+            item.addView(im, lp(isz, isz))
             item.addView(t, lp(WRAP, WRAP, 0f, 0, 2, 0, 0))
             item.setOnClickListener { showPage(idx) }
             row.addView(item, lp(0, WRAP, 1f))
@@ -429,8 +658,10 @@ class MainActivity : Activity() {
         bar.gravity = Gravity.CENTER_VERTICAL
         bar.setBackgroundColor(cBar)
         bar.setPadding(dp(6), dp(6), dp(6), dp(6))
-        bar.addView(iconBtn(R.drawable.ic_back) { cur?.web?.let { if (it.canGoBack()) it.goBack() } }, lp(dp(38), dp(38)))
-        bar.addView(iconBtn(R.drawable.ic_forward) { cur?.web?.let { if (it.canGoForward()) it.goForward() } }, lp(dp(38), dp(38)))
+        barBack = iconBtn(R.drawable.ic_back) { cur?.web?.let { if (it.canGoBack()) it.goBack() } }
+        bar.addView(barBack, lp(dp(38), dp(38)))
+        barFwd = iconBtn(R.drawable.ic_forward) { cur?.web?.let { if (it.canGoForward()) it.goForward() } }
+        bar.addView(barFwd, lp(dp(38), dp(38)))
 
         urlBox = EditText(this)
         urlBox.setTextColor(cText)
@@ -453,11 +684,28 @@ class MainActivity : Activity() {
         bar.addView(urlBox, lp(0, dp(40), 1f, 4, 0, 4, 0))
 
         // زر التبويبات بجانب الرابط (يعرض العدد ويفتح قائمة التبويبات)
-        tabBtn = tv("1", 14f, cText, true)
+        tabBtn = tv("1", 12f, cText, true)
         tabBtn.gravity = Gravity.CENTER
-        tabBtn.background = bg(cBar, 10, cText)
-        tabBtn.setOnClickListener { showTabs() }
-        bar.addView(tabBtn, lp(dp(32), dp(32), 0f, 0, 0, 4, 0))
+        tabBtn.includeFontPadding = false
+        tabBtn.setPadding(0, 0, 0, 0)
+        tabBtn.maxLines = 1
+        tabBtn.layoutDirection = View.LAYOUT_DIRECTION_LTR
+        tabBtn.contentDescription = "التبويبات"
+        // مربع بحواف مستديرة بنفس لون وسماكة أيقونات الشريط (2dp) بدل المربع الصغير الغريب
+        val tabFrame = FrameLayout(this)
+        val tabShape = bg(Color.TRANSPARENT, 6, 0)
+        tabShape.setStroke(dp(2), cText)
+        tabBtn.background = tabShape
+        tabFrame.addView(tabBtn, FrameLayout.LayoutParams(dp(22), dp(22), Gravity.CENTER))
+        tabFrame.setPadding(dp(8), dp(8), dp(8), dp(8))
+        val rv = android.util.TypedValue()
+        if (theme.resolveAttribute(android.R.attr.selectableItemBackgroundBorderless, rv, true)) {
+            tabFrame.foreground = resources.getDrawable(rv.resourceId, theme)
+        }
+        tabFrame.isClickable = true
+        tabFrame.setOnClickListener { showTabs() }
+        barTabs = tabFrame
+        bar.addView(tabFrame, lp(dp(38), dp(38), 0f, 0, 0, 0, 0))
 
         pct = tv("", 11f, cAccent, true)
         pct.visibility = View.GONE
@@ -471,11 +719,12 @@ class MainActivity : Activity() {
                     t.loading = false
                     updateLoadUi()
                 } else {
-                    t.web.reload()
+                    hardReload(t)
                 }
             }
         }
         bar.addView(reloadBtn, lp(dp(38), dp(38)))
+        bar.addView(iconBtn(R.drawable.ic_batch) { capturePage() }, lp(dp(38), dp(38)))
         col.addView(bar, lp(MATCH, WRAP))
 
         // شريط تقدّم تحميل الصفحة
@@ -485,6 +734,7 @@ class MainActivity : Activity() {
         loadBar.progressBackgroundTintList = ColorStateList.valueOf(cLine)
         loadBar.visibility = View.INVISIBLE
         col.addView(loadBar, lp(MATCH, dp(4)))
+        col.addView(buildFindBar(), lp(MATCH, WRAP))
 
         // التبويبات
         val tabsScroll = HorizontalScrollView(this)
@@ -497,14 +747,17 @@ class MainActivity : Activity() {
         plusChip.gravity = Gravity.CENTER
         plusChip.background = bg(cCard, 16, cLine)
         plusChip.setPadding(dp(14), dp(4), dp(14), dp(4))
-        plusChip.setOnClickListener { newTab(prefs().getString("home", HOME) ?: HOME) }
+        plusChip.setOnClickListener { newHomeTab() }
         tabsRow.addView(plusChip, lp(WRAP, WRAP, 0f, 3, 3, 3, 3))
         tabsScroll.addView(tabsRow)
         // شريط التبويبات القديم لم يعد يُعرض؛ التبويبات من الزر بجانب الرابط
 
         // منطقة الصفحة: تملأ كل المساحة المتبقية
         container = FrameLayout(this)
-        col.addView(container, lp(MATCH, 0, 1f))
+        val area = FrameLayout(this)
+        area.addView(container, FrameLayout.LayoutParams(MATCH, MATCH))
+        area.addView(buildStart(), FrameLayout.LayoutParams(MATCH, MATCH))
+        col.addView(area, lp(MATCH, 0, 1f))
 
         frame.addView(col, FrameLayout.LayoutParams(MATCH, MATCH))
 
@@ -516,6 +769,18 @@ class MainActivity : Activity() {
         val bp = FrameLayout.LayoutParams(WRAP, WRAP, Gravity.BOTTOM or Gravity.END)
         bp.setMargins(dp(14), dp(14), dp(14), dp(14))
         frame.addView(badge, bp)
+
+        // زر تحميل الفيديو الظاهر: يظهر عندما يلتقط التطبيق فيديو مسجلاً في التبويب الحالي
+        dlFab = tv("⬇ تحميل الفيديو", 14f, Color.WHITE, true)
+        dlFab.background = bg(cAccent, 24)
+        dlFab.setPadding(dp(18), dp(12), dp(18), dp(12))
+        dlFab.elevation = dp(6).toFloat()
+        dlFab.visibility = View.GONE
+        dlFab.setOnClickListener { onFabClick() }
+        val fp = FrameLayout.LayoutParams(WRAP, WRAP, Gravity.BOTTOM or Gravity.END)
+        fp.setMargins(dp(14), dp(14), dp(14), dp(70))
+        frame.addView(dlFab, fp)
+        applyBarSizes()
         return frame
     }
 
@@ -526,16 +791,20 @@ class MainActivity : Activity() {
         val head = LinearLayout(this)
         head.orientation = LinearLayout.HORIZONTAL
         head.gravity = Gravity.CENTER_VERTICAL
-        head.addView(tv("الفيديوهات الملتقطة", 20f, cText, true), lp(0, WRAP, 1f))
+        head.addView(tv("التحميلات", 20f, cText, true), lp(0, WRAP, 1f))
+        head.addView(pill("المخزن", true) { openStorage() }, lp(WRAP, WRAP, 0f, 0, 0, 6, 0))
         head.addView(pill("مسح القائمة", false) { clearFound() })
         col.addView(head, lp(MATCH, WRAP, 0f, 0, 0, 0, 6))
         col.addView(tv("شغّل الفيديو داخل المتصفح وستظهر روابطه هنا ثم اضغط تحميل. الملفات تُحفظ في مجلد التحميلات.", 12f, cMuted), lp(MATCH, WRAP, 0f, 0, 0, 0, 12))
-        activeTitle = tv("جارٍ التحميل الآن", 15f, cAccent, true)
-        activeTitle.visibility = View.GONE
+        activeTitle = tv("جارٍ التحميل الآن", 16f, cAccent, true)
         col.addView(activeTitle, lp(MATCH, WRAP, 0f, 0, 0, 0, 6))
         activeBox = LinearLayout(this)
         activeBox.orientation = LinearLayout.VERTICAL
         col.addView(activeBox, lp(MATCH, WRAP))
+        activeEmpty = tv("لا توجد تحميلات جارية الآن", 13f, cMuted)
+        activeEmpty.setPadding(0, dp(4), 0, dp(14))
+        col.addView(activeEmpty, lp(MATCH, WRAP))
+        col.addView(tv("الفيديوهات الملتقطة", 15f, cText, true), lp(MATCH, WRAP, 0f, 0, 6, 0, 6))
         emptyTv = tv("لا توجد روابط ملتقطة بعد", 14f, cMuted)
         emptyTv.gravity = Gravity.CENTER
         emptyTv.setPadding(0, dp(40), 0, dp(40))
@@ -550,34 +819,41 @@ class MainActivity : Activity() {
     }
 
     private fun toolCard(res: Int, label: String, onClick: () -> Unit): LinearLayout {
+        val id = "tool_" + label
+        sizeIds[id] = Pair("بطاقات الأدوات", label)
+        val pb = pctB(id)
+        val pi = pctI(id)
         val c = LinearLayout(this)
         c.orientation = LinearLayout.VERTICAL
         c.gravity = Gravity.CENTER
         c.background = bg(cCard, 14, cLine)
-        c.setPadding(dp(8), dp(16), dp(8), dp(16))
+        c.minimumHeight = dp(92 * pb / 100)
+        c.setPadding(dp(6), dp(12 * pb / 100), dp(6), dp(12 * pb / 100))
         val i = ImageView(this)
         i.setImageResource(res)
         i.setColorFilter(cAccent)
-        c.addView(i, lp(dp(28), dp(28)))
-        val t = tv(label, 13f, cText)
+        val isz = dp(28 * pi / 100)
+        c.addView(i, lp(isz, isz))
+        val t = tv(label, (12f * pb / 100f).coerceIn(7f, 24f), cText)
         t.gravity = Gravity.CENTER
-        c.addView(t, lp(WRAP, WRAP, 0f, 0, 8, 0, 0))
+        c.addView(t, lp(WRAP, WRAP, 0f, 0, 6, 0, 0))
         c.setOnClickListener { onClick() }
         return c
     }
 
     private fun grid(parent: LinearLayout, cards: List<View>) {
+        val cols = prefs().getInt("toolcols", 3).coerceIn(2, 4)
         var i = 0
         while (i < cards.size) {
             val row = LinearLayout(this)
             row.orientation = LinearLayout.HORIZONTAL
-            for (k in 0..1) {
+            for (k in 0 until cols) {
                 val v = cards.getOrNull(i + k)
-                if (v != null) row.addView(v, lp(0, WRAP, 1f, 4, 4, 4, 4))
-                else row.addView(View(this), lp(0, 1, 1f, 4, 4, 4, 4))
+                if (v != null) row.addView(v, lp(0, WRAP, 1f, 3, 3, 3, 3))
+                else row.addView(View(this), lp(0, 1, 1f, 3, 3, 3, 3))
             }
             parent.addView(row, lp(MATCH, WRAP))
-            i += 2
+            i += cols
         }
     }
 
@@ -591,7 +867,7 @@ class MainActivity : Activity() {
         card.orientation = LinearLayout.VERTICAL
         card.background = bg(cCard, 14, cLine)
         card.setPadding(dp(12), dp(12), dp(12), dp(12))
-        card.addView(tv("إضافة رابط يدوياً (m3u8 / mp4)", 14f, cText, true))
+        card.addView(tv("إضافة رابط يدوياً (m3u8 / mp4 / أي ملف)", 14f, cText, true))
         manualBox = EditText(this)
         manualBox.setTextColor(cText)
         manualBox.setHintTextColor(cMuted)
@@ -604,17 +880,30 @@ class MainActivity : Activity() {
         manualBox.inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI
         card.addView(manualBox, lp(MATCH, WRAP, 0f, 0, 8, 0, 0))
         card.addView(pill("إضافة للتحميلات", true) { addManual() }, lp(MATCH, WRAP, 0f, 0, 8, 0, 0))
-        col.addView(card, lp(MATCH, WRAP, 0f, 0, 0, 0, 10))
+        col.addView(card, lp(MATCH, WRAP, 0f, 0, 0, 0, 6))
 
+        section(col, "التصفح")
         grid(col, listOf(
-            toolCard(R.drawable.ic_add, "تبويب جديد") { newTab(prefs().getString("home", HOME) ?: HOME) },
-            toolCard(R.drawable.ic_star, "حفظ الصفحة في المفضلة") { addBookmark() },
-            toolCard(R.drawable.ic_bookmark, "المفضلة") { showBookmarks() },
-            toolCard(R.drawable.ic_copy, "نسخ رابط الصفحة") {
+            toolCard(R.drawable.ic_add, "تبويب جديد") { newHomeTab() },
+            toolCard(R.drawable.ic_home_solid, "الرئيسية") {
+                cur?.start = true
+                updateStart()
+                showPage(0)
+            },
+            toolCard(R.drawable.ic_search, "بحث بالصفحة") { openFind() },
+            toolCard(R.drawable.ic_up, "أعلى الصفحة") { cur?.web?.pageUp(true); showPage(0) },
+            toolCard(R.drawable.ic_down, "أسفل الصفحة") { cur?.web?.pageDown(true); showPage(0) },
+            toolCard(R.drawable.ic_paste, "فتح من الحافظة") { openFromClip() },
+            toolCard(R.drawable.ic_web, "تشغيل ملف html") { openHtmlFile() }
+        ))
+
+        section(col, "الصفحة الحالية")
+        grid(col, listOf(
+            toolCard(R.drawable.ic_link, "نسخ الرابط") {
                 val u = cur?.web?.url
                 if (u != null) copyText(u)
             },
-            toolCard(R.drawable.ic_share, "مشاركة الصفحة") {
+            toolCard(R.drawable.ic_share, "مشاركة") {
                 val u = cur?.web?.url
                 if (u != null) {
                     val i = Intent(Intent.ACTION_SEND)
@@ -623,7 +912,32 @@ class MainActivity : Activity() {
                     startActivity(Intent.createChooser(i, "مشاركة"))
                 }
             },
-            toolCard(R.drawable.ic_folder, "فتح مجلد التحميلات") {
+            toolCard(R.drawable.ic_star, "إضافة للمفضلة") { addBookmark() },
+            toolCard(R.drawable.ic_bookmark, "المفضلة") { showBookmarks() },
+            toolCard(R.drawable.ic_pin, "إضافة اختصار") {
+                val c = cur
+                val u = c?.web?.url
+                if (c == null || u == null) toast("افتح صفحة أولاً") else addShortcutDialog(c.title, u)
+            },
+            toolCard(R.drawable.ic_code, "سكربتات الصفحة") { showScripts() }
+        ))
+
+        section(col, "التبويبات والسجل")
+        grid(col, listOf(
+            toolCard(R.drawable.ic_tabs, "ترتيب التبويبات") { showTabs() },
+            toolCard(R.drawable.ic_undo, "المغلقة مؤخراً") { showClosed() },
+            toolCard(R.drawable.ic_close, "إغلاق الأخرى") { closeOthers() },
+            toolCard(R.drawable.ic_list, "روابط التبويبات") { copyTabs() },
+            toolCard(R.drawable.ic_history, "سجل التصفح") { showHistory() }
+        ))
+
+        section(col, "التحميلات والملفات")
+        grid(col, listOf(
+            toolCard(R.drawable.ic_download, "تحميل من الحافظة") { downloadFromClip() },
+            toolCard(R.drawable.ic_batch, "تحميل دفعة روابط") { batchLinks() },
+            toolCard(R.drawable.ic_copy, "نسخ روابط الفيديو") { copyFound() },
+            toolCard(R.drawable.ic_send, "مشاركة الروابط") { shareFound() },
+            toolCard(R.drawable.ic_folder, "مجلد التحميلات") {
                 try {
                     val i = Intent(DownloadManager.ACTION_VIEW_DOWNLOADS)
                     i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
@@ -632,22 +946,42 @@ class MainActivity : Activity() {
                     toast("تعذر فتح مجلد التحميلات")
                 }
             },
-            toolCard(R.drawable.ic_delete, "مسح الكاش والسجل") {
+            toolCard(R.drawable.ic_storage, "مخزن التطبيق") { openStorage() }
+        ))
+
+        section(col, "أدوات ذكية")
+        grid(col, listOf(
+            toolCard(R.drawable.ic_speed, "التحكم بالسرعة") { showSpeed() },
+            toolCard(R.drawable.ic_chart, "قياس السرعة") { speedTest() },
+            toolCard(R.drawable.ic_search_link, "فحص رابط") { inspectLink() },
+            toolCard(R.drawable.ic_report, "تقرير الأداء") { perfReport() },
+            toolCard(R.drawable.ic_batch, "التقاط كل فيديوهات الصفحة") { capturePage() },
+            toolCard(R.drawable.ic_list, "سجل الالتقاط") { showCapLog() },
+            toolCard(R.drawable.ic_search_link, "الروابط المستبعدة") { excludedDialog() }
+        ))
+
+        section(col, "التنظيف والذاكرة")
+        grid(col, listOf(
+            toolCard(R.drawable.ic_clean, "مسح الكاش") {
                 for (t in tabs) {
                     t.web.clearCache(true)
                     t.web.clearHistory()
                 }
                 toast("تم مسح الكاش والسجل")
             },
-            toolCard(R.drawable.ic_delete, "مسح الكوكيز") {
+            toolCard(R.drawable.ic_cookie, "مسح الكوكيز") {
                 CookieManager.getInstance().removeAllCookies(null)
                 CookieManager.getInstance().flush()
                 toast("تم مسح الكوكيز، سيُطلب تسجيل الدخول من جديد")
             },
             toolCard(R.drawable.ic_delete, "مسح قائمة التحميلات") { clearFound() },
-            toolCard(R.drawable.ic_tools, "سكربتات JavaScript") { showScripts() },
-            toolCard(R.drawable.ic_refresh, "الصفحات المغلقة مؤخراً") { showClosed() },
-            toolCard(R.drawable.ic_close, "إغلاق التبويبات الأخرى") { closeOthers() }
+            toolCard(R.drawable.ic_image, "مسح الصور المؤقتة") { rcClear() },
+            toolCard(R.drawable.ic_refresh, "تفريغ الذاكرة") { freeMem() }
+        ))
+
+        section(col, "الواجهة")
+        grid(col, listOf(
+            toolCard(R.drawable.ic_resize, "أحجام الأزرار") { showSizes() }
         ))
         val sv = ScrollView(this)
         sv.setBackgroundColor(cBg)
@@ -697,31 +1031,71 @@ class MainActivity : Activity() {
         s.loadWithOverviewMode = desk
         s.builtInZoomControls = true
         s.displayZoomControls = false
+        s.textZoom = prefs().getInt("textzoom", 100)
+        s.databaseEnabled = true
+        s.javaScriptCanOpenWindowsAutomatically = true
+        s.setSupportMultipleWindows(true)
+        s.setGeolocationEnabled(true)
+        s.setSupportZoom(true)
+        s.mixedContentMode = WebSettings.MIXED_CONTENT_COMPATIBILITY_MODE
         curUa = s.userAgentString ?: ""
+    }
+
+    private fun section(col: LinearLayout, title: String) {
+        col.addView(tv(title, 13f, cAccent, true), lp(MATCH, WRAP, 0f, 4, 10, 0, 6))
+    }
+
+    private fun actionRow(parent: LinearLayout, title: String, sub: String, btn: String, onClick: () -> Unit) {
+        val row = LinearLayout(this)
+        row.orientation = LinearLayout.HORIZONTAL
+        row.gravity = Gravity.CENTER_VERTICAL
+        row.setPadding(0, dp(8), 0, dp(8))
+        val txt = LinearLayout(this)
+        txt.orientation = LinearLayout.VERTICAL
+        txt.addView(tv(title, 15f, cText, true))
+        txt.addView(tv(sub, 12f, cMuted))
+        row.addView(txt, lp(0, WRAP, 1f))
+        row.addView(pill(btn, false) { onClick() })
+        parent.addView(row, lp(MATCH, WRAP))
     }
 
     private fun buildSettings(): View {
         val col = LinearLayout(this)
         col.orientation = LinearLayout.VERTICAL
         col.setPadding(dp(14), dp(14), dp(14), dp(24))
-        col.addView(tv("الإعدادات", 20f, cText, true), lp(MATCH, WRAP, 0f, 0, 0, 0, 12))
+        col.addView(tv("الإعدادات", 20f, cText, true), lp(MATCH, WRAP, 0f, 0, 0, 0, 6))
 
-        // المتصفح
-        col.addView(tv("المتصفح", 13f, cMuted, true), lp(MATCH, WRAP, 0f, 4, 0, 0, 6))
-        val c1 = settingsCard(col)
-        switchRow(c1, "حظر الإعلانات", "يمنع الطلبات المعروفة لشبكات الإعلانات", "adblock", true) { adBlock = it }
-        switchRow(c1, "تشغيل الفيديو تلقائياً", "تشغيل الفيديو بدون لمس الشاشة لالتقاط رابطه", "autoplay", true) {
-            for (t in tabs) applyWebSettings(t.web)
+        // ---- عام ----
+        section(col, "عام")
+        val c0 = settingsCard(col)
+        switchRow(c0, "البدء بالشاشة الرئيسية", "تظهر شاشة البحث والمواقع عند بدء التطبيق وعند فتح تبويب جديد", "startscreen", true) { }
+
+        val eBox = LinearLayout(this)
+        eBox.orientation = LinearLayout.VERTICAL
+        eBox.setPadding(0, dp(8), 0, dp(8))
+        eBox.addView(tv("محرك البحث", 15f, cText, true))
+        eBox.addView(tv("يُستخدم عند كتابة كلمات بدل رابط", 12f, cMuted))
+        val eRow = LinearLayout(this)
+        eRow.orientation = LinearLayout.HORIZONTAL
+        val eg = pill("جوجل", true) { }
+        val ed = pill("DuckDuckGo", false) { }
+        val eb = pill("Bing", false) { }
+        fun paintE() {
+            val e = prefs().getString("engine", "google")
+            styleChip(eg, e == "google")
+            styleChip(ed, e == "ddg")
+            styleChip(eb, e == "bing")
         }
-        switchRow(c1, "توفير البيانات", "يمنع تحميل الصور، يفضّل الكاش، يوقف التشغيل التلقائي، ويختار أقل جودة عند التحميل (أعد تحميل الصفحة)", "saver", false) {
-            for (t in tabs) applyWebSettings(t.web)
-            toast("أعد تحميل الصفحة ليسري التغيير")
-        }
-        switchRow(c1, "أزرار التحميل على الفيديو والصور", "أزرار تحميل ونسخ وشريط تقديم فوق كل فيديو وصورة (تُطبّق عند فتح الصفحة)", "overlay", true) { }
-        switchRow(c1, "وضع سطح المكتب", "يفتح المواقع بنسختها الكاملة", "desktop", false) {
-            for (t in tabs) applyWebSettings(t.web)
-            cur?.web?.reload()
-        }
+        eg.setOnClickListener { prefs().edit().putString("engine", "google").apply(); paintE() }
+        ed.setOnClickListener { prefs().edit().putString("engine", "ddg").apply(); paintE() }
+        eb.setOnClickListener { prefs().edit().putString("engine", "bing").apply(); paintE() }
+        paintE()
+        eRow.addView(eg, lp(WRAP, WRAP, 0f, 0, 0, 6, 0))
+        eRow.addView(ed, lp(WRAP, WRAP, 0f, 0, 0, 6, 0))
+        eRow.addView(eb)
+        eBox.addView(eRow, lp(MATCH, WRAP, 0f, 0, 8, 0, 0))
+        c0.addView(eBox, lp(MATCH, WRAP))
+
         val homeBox = EditText(this)
         homeBox.setText(prefs().getString("home", HOME))
         homeBox.setTextColor(cText)
@@ -731,22 +1105,83 @@ class MainActivity : Activity() {
         homeBox.layoutDirection = View.LAYOUT_DIRECTION_LTR
         homeBox.gravity = Gravity.CENTER_VERTICAL or Gravity.START
         homeBox.setSingleLine()
-        c1.addView(tv("الصفحة الرئيسية", 15f, cText, true), lp(MATCH, WRAP, 0f, 0, 8, 0, 4))
-        c1.addView(homeBox, lp(MATCH, WRAP))
-        c1.addView(pill("حفظ الصفحة الرئيسية", false) {
+        c0.addView(tv("صفحة البدء (عند إيقاف الشاشة الرئيسية)", 15f, cText, true), lp(MATCH, WRAP, 0f, 0, 8, 0, 4))
+        c0.addView(homeBox, lp(MATCH, WRAP))
+        c0.addView(pill("حفظ صفحة البدء", false) {
             val v = homeBox.text.toString().trim()
             prefs().edit().putString("home", if (v.isEmpty()) HOME else fix(v)).apply()
             toast("تم الحفظ")
-        }, lp(MATCH, WRAP, 0f, 0, 8, 0, 4))
+        }, lp(MATCH, WRAP, 0f, 0, 8, 0, 8))
+        switchRow(c0, "الوضع الداكن", "تغيير المظهر يعيد تشغيل الواجهة مع الحفاظ على التبويبات", "dark", true) { recreate() }
 
-        // التحميل
-        col.addView(tv("التحميل", 13f, cMuted, true), lp(MATCH, WRAP, 0f, 4, 6, 0, 6))
+        // ---- المتصفح ----
+        section(col, "المتصفح")
+        val c1 = settingsCard(col)
+        switchRow(c1, "حظر الإعلانات", "يمنع الطلبات المعروفة لشبكات الإعلانات", "adblock", true) { adBlock = it }
+        switchRow(c1, "وضع سطح المكتب", "يفتح المواقع بنسختها الكاملة", "desktop", false) {
+            for (t in tabs) applyWebSettings(t.web)
+            cur?.let { hardReload(it) }
+        }
+        switchRow(c1, "تشغيل الفيديو تلقائياً", "تشغيل الفيديو بدون لمس الشاشة لالتقاط رابطه", "autoplay", true) {
+            for (t in tabs) applyWebSettings(t.web)
+        }
+        switchRow(c1, "توفير البيانات", "يمنع تحميل الصور، يفضّل الكاش، يوقف التشغيل التلقائي، ويختار أقل جودة عند التحميل (أعد تحميل الصفحة)", "saver", false) {
+            for (t in tabs) applyWebSettings(t.web)
+            toast("أعد تحميل الصفحة ليسري التغيير")
+        }
+
+        // ---- حفظ الصفحات (مستقل تماماً عن زر توفير البيانات) ----
+        section(col, "حفظ الصفحات")
+        val cp = settingsCard(col)
+        switchRow(cp, "حفظ الصفحات على الجهاز", "تُحفظ الصفحة وبياناتها بعد تحميلها وتُفتح من الجهاز عند الرجوع إليها أو بعد إغلاق التطبيق. زر التحديث يجلب نسخة جديدة. لا علاقة له بزر توفير البيانات", "cachepages", true) {
+            for (t in tabs) applyWebSettings(t.web)
+        }
+        switchRow(cp, "مخزن الصور والأيقونات", "يحفظ كل صورة وأيقونة تظهر في الصفحات على الجهاز حتى لو منع الموقع التخزين، فلا تُحمَّل من جديد في كل مرة (حتى بعد إغلاق التطبيق)", "rescache", true) { }
+        choiceRow(cp, "حجم المخزن الأقصى", "الأصل: بلا حد. إن حددت حجماً فعند الامتلاء تُحذف الأقدم استخداماً أولاً", "rcmb", arrayOf("بلا حد", "500 م.ب", "1000 م.ب", "3000 م.ب"), intArrayOf(0, 500, 1000, 3000), 0) { Thread { rcTrim() }.start() }
+        actionRow(cp, "مسح مخزن الصور", "يحذف الصور المحفوظة فقط", "مسح") { rcClear() }
+
+        // ---- الفيديو والتحميل ----
+        section(col, "الفيديو والتحميل")
         val c2 = settingsCard(col)
-        val cnt = tv("" + prefs().getInt("threads", 3), 16f, cText, true)
+        switchRow(c2, "أزرار التحميل على الفيديو", "أزرار تحميل ونسخ وشريط تقديم فوق كل فيديو (تُطبّق عند فتح الصفحة). الصور: اضغط مطولاً على الصورة", "overlay", true) { }
+        numRow(c2, "أقصى خطوات التمرير في الالتقاط", "عدد خطوات التمرير الأعلى. الصفر: يستمر حتى نهاية القائمة", "scanmax", 0)
+        numRow(c2, "خطوات الثبات قبل إنهاء الالتقاط", "كم خطوة تبقى فيها الصفحة بلا جديد قبل الإنهاء. زدها للمواقع البطيئة", "scanstill", 6, "")
+        numRow(c2, "زمن كل خطوة تمرير (ملّي ثانية)", "الانتظار بعد كل تمريرة ليحمّل الموقع المزيد. زدها للمواقع البطيئة", "scandelay", 750, "")
+        switchRow(c2, "تشغيل الفيديوهات أثناء التقاط الصفحة", "عند تفعيله يشغّل التطبيق كل فيديو في الصفحة بصوته الطبيعي أثناء الالتقاط، ولا يوقفه أبداً، فيبقى يعمل حتى توقفه أنت أو تخرج من الصفحة. الأصل: مغلق، والالتقاط يعمل بدونه", "scanplay", false) { }
+        numRow(c2, "حد الثقة في الحكم (%)", "أي رابط تقل ثقة الحكم عليه عن هذه القيمة يظهر دائماً بوسم «تقديري» لتصنفه أنت يدوياً. الصفر: يُعتمد الحكم دائماً", "uncert", 75, "بدون وسم «تقديري»")
+        numRow(c2, "انتظار فحص البث المباشر (ثوانٍ)", "المدة بين فحصي القائمة للتمييز بين المباشر والمسجل. الصفر: تلقائي حسب القائمة", "livewait", 0, "تلقائي")
+        numRow(c2, "خيوط تحليل الروابط", "عدد الخيوط التي تحلل الروابط معاً", "anthreads", 16, "") { applyPools() }
+        numRow(c2, "خيوط فحص الشبكة", "عدد الخيوط التي تفحص طلبات الصفحة معاً", "prthreads", 8, "") { applyPools() }
+        numRow(c2, "حد قراءة الردود غير النصية (كيلوبايت)", "يمنع قراءة ملفات ثنائية ضخمة بحثاً عن روابط. الصفر: بلا حد", "readcap", 0)
+        switchRow(c2, "قراءة البث المستمر (event-stream)", "الأصل: مفعّل. يقرأ البث المستمر بحثاً عن روابط الفيديو. أوقفه فقط إن لاحظت بطئاً أو استهلاكاً للذاكرة (وحد قراءة الردود أعلاه يتحكم بالحجم)", "scanstream", true) { }
+        numRow(c2, "أقصى أسطر سجل الالتقاط المحفوظة", "الصفر: يحتفظ بكل الأسطر حتى تغلق التطبيق", "logcap", 0)
+        numRow(c2, "أسطر السجل المعروضة في النافذة", "الصفر: يعرض الكل. زر النسخ ينسخ الكل دائماً", "logshow", 0, "الكل")
+        switchRow(c2, "التقاط الملفات الصوتية", "mp3 و aac و m4a و ogg و opus و wav و flac تظهر في قائمة الروابط مثل الفيديو", "capaudio", true) { }
+        switchRow(c2, "التقاط ملفات ts و m4s المستقلة", "أي ملف ts أو m4s ليس جزءاً من قائمة بث معروفة يُلتقط ويظهر", "capseg", true) { }
+        switchRow(c2, "إظهار أجزاء القوائم المعروفة", "الأصل: مغلق حتى لا تمتلئ القائمة بمئات الأجزاء، فالفيديو الكامل يظهر عبر ملف m3u8 أو mpd. فعّله لترى كل جزء بنفسه", "showseg", false) { }
+        numRow(c2, "أقصى عدد أزرار تحميل فوق الفيديوهات في الصفحة", "عدد عناصر الفيديو التي يضع التطبيق عليها أزرار التحميل. الصفر: بلا حد (يُطبّق عند فتح الصفحة)", "maxoverlay", 0)
+        switchRow(c2, "محاولة التحميل رغم علامة DRM", "الأصل: مغلق. فك تشفير DRM غير ممكن، فالمحاولة تحفظ بيانات مشفّرة غالباً لا تعمل. تفعيله يلغي الرفض ويترك لك القرار", "ignoredrm", false) { }
+        switchRow(c2, "تحميل خام عند تشفير HLS غير مدعوم", "التطبيق يفك AES-128 فقط. عند أي تشفير آخر مثل SAMPLE-AES يرفض افتراضياً. تفعيله يحمّل الأجزاء كما هي بدون فك", "ignoreenc", false) { }
+        numRow(c2, "أقصى عدد تحويلات الروابط (redirects)", "الصفر: بلا حد", "redirects", 30)
+        numRow(c2, "مهلة الاتصال (ثوانٍ)", "الصفر: ينتظر بلا مهلة. زدها للخوادم البطيئة", "conntimeout", 45, "بلا مهلة")
+        numRow(c2, "مهلة القراءة (ثوانٍ)", "الصفر: ينتظر بلا مهلة. زدها للخوادم البطيئة", "readtimeout", 120, "بلا مهلة")
+        actionRow(c2, "رؤوس HTTP مخصصة", "سطر لكل رأس بصيغة Name: value (مثل Referer أو User-Agent أو Cookie). تُضاف لكل طلب فحص وتحميل وتتغلب على القيم التلقائية، وتحل مشكلة المواقع التي ترفض التحميل", "تعديل") {
+            val et = EditText(this)
+            et.setText(prefs().getString("customhdr", ""))
+            et.hint = "Referer: https://example.com/"
+            et.minLines = 4
+            et.gravity = Gravity.TOP
+            et.layoutDirection = View.LAYOUT_DIRECTION_LTR
+            AlertDialog.Builder(this).setTitle("رؤوس HTTP مخصصة").setView(et)
+                .setPositiveButton("حفظ") { _, _ -> prefs().edit().putString("customhdr", et.text.toString()).apply(); toast("تم الحفظ") }
+                .setNegativeButton("إلغاء", null).show()
+        }
+        switchRow(c2, "إظهار البث المباشر", "الأصل: مفعّل، فيظهر المسجل والمباشر. أوقفه لإخفاء البث المباشر (ما أُخفي يبقى في «الروابط المستبعدة»)", "showlive", true) { }
+        val cnt = tv("" + prefs().getInt("threads", 8), 16f, cText, true)
         cnt.gravity = Gravity.CENTER
         cnt.minWidth = dp(34)
         fun setThr(n: Int) {
-            val v = n.coerceIn(1, 6)
+            val v = n.coerceIn(1, 128)
             prefs().edit().putInt("threads", v).apply()
             cnt.text = "" + v
         }
@@ -757,11 +1192,11 @@ class MainActivity : Activity() {
         val thrTxt = LinearLayout(this)
         thrTxt.orientation = LinearLayout.VERTICAL
         thrTxt.addView(tv("عدد الأجزاء المتوازية", 15f, cText, true))
-        thrTxt.addView(tv("أجزاء HLS التي تُحمّل في نفس الوقت (1 - 6)", 12f, cMuted))
+        thrTxt.addView(tv("عدد اتصالات التحميل المتوازية للملف الواحد (1 - 32)", 12f, cMuted))
         thrRow.addView(thrTxt, lp(0, WRAP, 1f))
-        thrRow.addView(pill("+", false) { setThr(prefs().getInt("threads", 3) + 1) })
+        thrRow.addView(pill("+", false) { setThr(prefs().getInt("threads", 8) + 1) })
         thrRow.addView(cnt)
-        thrRow.addView(pill("−", false) { setThr(prefs().getInt("threads", 3) - 1) })
+        thrRow.addView(pill("−", false) { setThr(prefs().getInt("threads", 8) - 1) })
         c2.addView(thrRow, lp(MATCH, WRAP))
 
         val qRow = LinearLayout(this)
@@ -787,13 +1222,48 @@ class MainActivity : Activity() {
         qRow.addView(lo)
         c2.addView(qRow, lp(MATCH, WRAP))
 
-        // المظهر
-        col.addView(tv("المظهر", 13f, cMuted, true), lp(MATCH, WRAP, 0f, 4, 6, 0, 6))
-        val c3 = settingsCard(col)
-        switchRow(c3, "الوضع الداكن", "تغيير المظهر يعيد تشغيل الواجهة مع الحفاظ على التبويبات", "dark", true) { recreate() }
+        // ---- الواجهة ----
+        section(col, "الواجهة")
+        val c6 = settingsCard(col)
+        actionRow(c6, "أحجام الأزرار والأيقونات", "تحكم حر بحجم كل زر وكل أيقونة وعدد أعمدة الأدوات", "فتح") { showSizes() }
 
-        // حول
-        col.addView(tv("حول التطبيق", 13f, cMuted, true), lp(MATCH, WRAP, 0f, 4, 6, 0, 6))
+        // ---- السرعة والأداء ----
+        section(col, "السرعة والأداء")
+        val c3 = settingsCard(col)
+        switchRow(c3, "إيقاف التبويبات الخلفية", "يوقف نشاط التبويبات المخفية لتسريع التبويب الحالي وتوفير الذاكرة والبطارية", "pausebg", true) {
+            cur?.let { switchTo(it) }
+        }
+        actionRow(c3, "التحكم بالسرعة", "حد السرعة الحر وعدد الاتصالات وعدد التحميلات المتزامنة (بلا قيود)", "ضبط") { showSpeed() }
+        actionRow(c3, "قياس سرعة الشبكة", "يقيس سرعتك الفعلية ويقترح أفضل عدد اتصالات", "قياس") { speedTest() }
+        choiceRow(c3, "مهلة تحميل الصفحة", "يوقف الصفحة البطيئة تلقائياً بعد هذه المدة", "pgtimeout", arrayOf("بلا مهلة", "15 ثانية", "30 ثانية", "60 ثانية"), intArrayOf(0, 15, 30, 60), 0)
+        choiceRow(c3, "حجم الخط في الصفحات", "يُطبّق على كل التبويبات", "textzoom", arrayOf("80%", "100%", "120%", "150%"), intArrayOf(80, 100, 120, 150), 100) {
+            for (t in tabs) applyWebSettings(t.web)
+        }
+        actionRow(c3, "تقرير الأداء", "التبويبات والذاكرة والتحميلات", "عرض") { perfReport() }
+        actionRow(c3, "تفريغ الذاكرة", "يمسح ذاكرة التبويبات الخلفية", "تفريغ") { freeMem() }
+
+        // ---- الخصوصية والبيانات ----
+        section(col, "الخصوصية والبيانات")
+        val c5 = settingsCard(col)
+        actionRow(c5, "سجل التصفح", "حذف كل الصفحات المسجلة", "مسح") {
+            clearHistory()
+            toast("تم مسح السجل")
+        }
+        actionRow(c5, "الكاش", "حذف الملفات المؤقتة للصفحات", "مسح") {
+            for (t in tabs) {
+                t.web.clearCache(true)
+                t.web.clearHistory()
+            }
+            toast("تم مسح الكاش")
+        }
+        actionRow(c5, "الكوكيز", "سيُطلب تسجيل الدخول من جديد", "مسح") {
+            CookieManager.getInstance().removeAllCookies(null)
+            CookieManager.getInstance().flush()
+            toast("تم مسح الكوكيز")
+        }
+
+        // ---- حول ----
+        section(col, "حول التطبيق")
         val c4 = settingsCard(col)
         c4.gravity = Gravity.CENTER_HORIZONTAL
         val logo = ImageView(this)
@@ -814,6 +1284,421 @@ class MainActivity : Activity() {
         sv.setBackgroundColor(cBg)
         sv.addView(col)
         return sv
+    }
+
+    // ---------- الشاشة الرئيسية (بحث + مواقع + مفضلة + اختصارات) ----------
+
+    private fun newHomeTab() {
+        if (prefs().getBoolean("startscreen", true)) newTab("") else newTab(prefs().getString("home", HOME) ?: HOME)
+    }
+
+    private fun updateStart() {
+        val on = cur?.start == true
+        startView.visibility = if (on) View.VISIBLE else View.GONE
+        if (on) refreshStart()
+    }
+
+    private fun hostOf(u: String): String = Uri.parse(u).host?.removePrefix("www.") ?: u.take(20)
+
+    private fun searchUrl(q: String): String {
+        val e = URLEncoder.encode(q, "UTF-8")
+        return when (prefs().getString("engine", "google")) {
+            "ddg" -> "https://duckduckgo.com/?q=" + e
+            "bing" -> "https://www.bing.com/search?q=" + e
+            else -> "https://www.google.com/search?q=" + e
+        }
+    }
+
+    private fun buildStart(): View {
+        val sv = ScrollView(this)
+        sv.setBackgroundColor(cBg)
+        sv.isFillViewport = true
+        val col = LinearLayout(this)
+        col.orientation = LinearLayout.VERTICAL
+        col.gravity = Gravity.CENTER_HORIZONTAL
+        col.setPadding(dp(18), dp(32), dp(18), dp(24))
+
+        val logo = ImageView(this)
+        logo.setImageResource(R.drawable.logo)
+        col.addView(logo, lp(dp(76), dp(76)))
+        val nm = tv("Tango DL", 22f, cText, true)
+        nm.gravity = Gravity.CENTER
+        col.addView(nm, lp(WRAP, WRAP, 0f, 0, 8, 0, 18))
+
+        // مربع البحث: أيقونة بحث ثم الحقل
+        val sb = LinearLayout(this)
+        sb.orientation = LinearLayout.HORIZONTAL
+        sb.gravity = Gravity.CENTER_VERTICAL
+        sb.background = bg(cCard, 26, cLine)
+        sb.setPadding(dp(14), 0, dp(14), 0)
+        val si = ImageView(this)
+        si.setImageResource(R.drawable.ic_search)
+        si.setColorFilter(cAccent)
+        startBox = EditText(this)
+        startBox.setTextColor(cText)
+        startBox.setHintTextColor(cMuted)
+        startBox.hint = "ابحث أو اكتب رابطاً"
+        startBox.textSize = 15f
+        startBox.setBackgroundColor(Color.TRANSPARENT)
+        startBox.setSingleLine()
+        startBox.imeOptions = EditorInfo.IME_ACTION_SEARCH
+        startBox.inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI
+        val go: () -> Unit = {
+            val q = startBox.text.toString().trim()
+            if (q.isNotEmpty()) {
+                startBox.setText("")
+                load(q)
+            }
+        }
+        startBox.setOnEditorActionListener { _, id, ev ->
+            if (id == EditorInfo.IME_ACTION_SEARCH || id == EditorInfo.IME_ACTION_GO || (ev != null && ev.keyCode == KeyEvent.KEYCODE_ENTER)) {
+                go()
+                true
+            } else false
+        }
+        si.setOnClickListener { go() }
+        sb.addView(si, lp(dp(24), dp(24)))
+        sb.addView(startBox, lp(0, dp(50), 1f, 10, 0, 0, 0))
+        col.addView(sb, lp(MATCH, WRAP))
+
+        // أيقونات: المفضلة / الاختصارات / السجل / التحميلات
+        val ir = LinearLayout(this)
+        ir.orientation = LinearLayout.HORIZONTAL
+        ir.gravity = Gravity.CENTER
+        fun act(res: Int, label: String, f: () -> Unit) {
+            val c = LinearLayout(this)
+            c.orientation = LinearLayout.VERTICAL
+            c.gravity = Gravity.CENTER_HORIZONTAL
+            val ic = ImageView(this)
+            ic.setImageResource(res)
+            ic.setColorFilter(cAccent)
+            ic.background = bg(cCard, 24, cLine)
+            ic.setPadding(dp(12), dp(12), dp(12), dp(12))
+            c.addView(ic, lp(dp(48), dp(48)))
+            val t = tv(label, 11f, cMuted)
+            t.gravity = Gravity.CENTER
+            c.addView(t, lp(WRAP, WRAP, 0f, 0, 4, 0, 0))
+            c.setOnClickListener { f() }
+            ir.addView(c, lp(0, WRAP, 1f))
+        }
+        act(R.drawable.ic_bookmark, "المفضلة") { showBookmarks() }
+        act(R.drawable.ic_add, "الاختصارات") { showShortcuts() }
+        act(R.drawable.ic_history, "السجل") { showHistory() }
+        act(R.drawable.ic_download, "التحميلات") { showPage(1) }
+        col.addView(ir, lp(MATCH, WRAP, 0f, 0, 18, 0, 0))
+
+        // المواقع
+        val h1 = LinearLayout(this)
+        h1.orientation = LinearLayout.HORIZONTAL
+        h1.gravity = Gravity.CENTER_VERTICAL
+        h1.addView(tv("المواقع", 15f, cText, true), lp(0, WRAP, 1f))
+        h1.addView(pill("+ إضافة", false) { addShortcutDialog() })
+        col.addView(h1, lp(MATCH, WRAP, 0f, 0, 22, 0, 6))
+        startSites = LinearLayout(this)
+        startSites.orientation = LinearLayout.VERTICAL
+        col.addView(startSites, lp(MATCH, WRAP))
+
+        // المفضلة
+        col.addView(tv("المفضلة", 15f, cText, true), lp(MATCH, WRAP, 0f, 0, 22, 0, 6))
+        startBm = LinearLayout(this)
+        startBm.orientation = LinearLayout.VERTICAL
+        col.addView(startBm, lp(MATCH, WRAP))
+
+        sv.addView(col)
+        startView = sv
+        startView.visibility = View.GONE
+        return sv
+    }
+
+    private fun siteTile(label: String, onClick: () -> Unit, onLong: (() -> Unit)?, glyph: String = ""): View {
+        val c = LinearLayout(this)
+        c.orientation = LinearLayout.VERTICAL
+        c.gravity = Gravity.CENTER_HORIZONTAL
+        c.setPadding(dp(2), dp(6), dp(2), dp(6))
+        val g = if (glyph.isNotEmpty()) glyph else (label.trim().firstOrNull()?.uppercaseChar()?.toString() ?: "؟")
+        val ch = tv(g, 20f, cAccent, true)
+        ch.gravity = Gravity.CENTER
+        ch.background = bg(cAccentSoft, 26)
+        c.addView(ch, lp(dp(52), dp(52)))
+        val t = tv(label, 12f, cText)
+        t.gravity = Gravity.CENTER
+        t.maxLines = 1
+        t.ellipsize = TextUtils.TruncateAt.END
+        c.addView(t, lp(MATCH, WRAP, 0f, 0, 6, 0, 0))
+        c.setOnClickListener { onClick() }
+        if (onLong != null) c.setOnLongClickListener {
+            onLong()
+            true
+        }
+        return c
+    }
+
+    private fun tileGrid(parent: LinearLayout, tiles: List<View>) {
+        var i = 0
+        while (i < tiles.size) {
+            val row = LinearLayout(this)
+            row.orientation = LinearLayout.HORIZONTAL
+            for (k in 0 until 4) {
+                val v = if (i + k < tiles.size) tiles[i + k] else View(this)
+                row.addView(v, lp(0, WRAP, 1f))
+            }
+            parent.addView(row, lp(MATCH, WRAP))
+            i += 4
+        }
+    }
+
+    private fun confirmDelete(name: String, ok: () -> Unit) {
+        AlertDialog.Builder(this)
+            .setTitle(name)
+            .setMessage("حذف هذا العنصر؟")
+            .setPositiveButton("حذف") { _, _ -> ok() }
+            .setNegativeButton("إلغاء", null)
+            .show()
+    }
+
+    private fun refreshStart() {
+        startSites.removeAllViews()
+        startBm.removeAllViews()
+        val sc = loadShortcuts()
+        val tiles = ArrayList<View>()
+        for (i in sc.indices) {
+            val p = sc[i]
+            tiles.add(siteTile(p.first, { load(p.second) }, {
+                confirmDelete(p.first) {
+                    val l = loadShortcuts()
+                    if (i < l.size) l.removeAt(i)
+                    saveShortcuts(l)
+                    refreshStart()
+                }
+            }))
+        }
+        tiles.add(siteTile("إضافة", { addShortcutDialog() }, null, "+"))
+        tileGrid(startSites, tiles)
+
+        val bm = bookmarkList()
+        if (bm.isEmpty()) {
+            startBm.addView(tv("لا توجد صفحات محفوظة بعد. افتح صفحة ثم احفظها من «الأدوات».", 12f, cMuted))
+        } else {
+            val bt = ArrayList<View>()
+            for (u in bm) bt.add(siteTile(hostOf(u), { load(u) }, { confirmDelete(hostOf(u)) { removeBookmark(u) } }))
+            tileGrid(startBm, bt)
+        }
+    }
+
+    private fun loadShortcuts(): ArrayList<Pair<String, String>> {
+        val out = ArrayList<Pair<String, String>>()
+        val raw = prefs().getString("sc", null)
+        if (raw == null) {
+            out.add(Pair("تانجو", HOME))
+            out.add(Pair("جوجل", "https://www.google.com"))
+            out.add(Pair("يوتيوب", "https://m.youtube.com"))
+            out.add(Pair("ويكيبيديا", "https://ar.wikipedia.org"))
+            return out
+        }
+        try {
+            val a = org.json.JSONArray(raw)
+            for (i in 0 until a.length()) {
+                val o = a.getJSONObject(i)
+                out.add(Pair(o.getString("n"), o.getString("u")))
+            }
+        } catch (e: Throwable) {
+        }
+        return out
+    }
+
+    private fun saveShortcuts(l: List<Pair<String, String>>) {
+        val a = org.json.JSONArray()
+        for (p in l) {
+            val o = org.json.JSONObject()
+            o.put("n", p.first)
+            o.put("u", p.second)
+            a.put(o)
+        }
+        prefs().edit().putString("sc", a.toString()).apply()
+    }
+
+    private fun addShortcutDialog(n0: String = "", u0: String = "") {
+        val box = LinearLayout(this)
+        box.orientation = LinearLayout.VERTICAL
+        box.setPadding(dp(20), dp(8), dp(20), dp(0))
+        val n = EditText(this)
+        n.hint = "اسم الموقع"
+        n.setText(n0)
+        n.setSingleLine()
+        val u = EditText(this)
+        u.hint = "https://..."
+        u.setText(u0)
+        u.setSingleLine()
+        u.layoutDirection = View.LAYOUT_DIRECTION_LTR
+        u.gravity = Gravity.CENTER_VERTICAL or Gravity.START
+        u.inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI
+        box.addView(n, lp(MATCH, WRAP))
+        box.addView(u, lp(MATCH, WRAP))
+        AlertDialog.Builder(this)
+            .setTitle("إضافة اختصار")
+            .setView(box)
+            .setPositiveButton("حفظ") { _, _ ->
+                val raw = u.text.toString().trim()
+                if (raw.isEmpty()) {
+                    toast("اكتب الرابط")
+                } else {
+                    val fu = fix(raw)
+                    val name = n.text.toString().trim().ifEmpty { hostOf(fu) }
+                    val l = loadShortcuts()
+                    l.add(Pair(name, fu))
+                    saveShortcuts(l)
+                    refreshStart()
+                    toast("تمت إضافة الاختصار")
+                }
+            }
+            .setNegativeButton("إلغاء", null)
+            .show()
+    }
+
+    private fun showShortcuts() {
+        val l = loadShortcuts()
+        val b = AlertDialog.Builder(this).setTitle("الاختصارات (" + l.size + ")")
+        if (l.isEmpty()) b.setMessage("لا توجد اختصارات") else b.setItems(Array(l.size) { i -> l[i].first + "\n" + hostOf(l[i].second) }) { _, i -> load(l[i].second) }
+        b.setPositiveButton("إضافة") { _, _ -> addShortcutDialog() }
+        b.setNegativeButton("رجوع", null)
+        val dlg = b.show()
+        if (l.isNotEmpty()) dlg.listView.setOnItemLongClickListener { _, _, i, _ ->
+            dlg.dismiss()
+            if (i in l.indices) confirmDelete(l[i].first) {
+                val x = loadShortcuts()
+                if (i < x.size) x.removeAt(i)
+                saveShortcuts(x)
+                refreshStart()
+            }
+            true
+        }
+    }
+
+    // ---------- سجل التصفح ----------
+
+    private val histLock = Any()
+    @Volatile private var lastHist = ""
+
+    private fun histFile() = File(filesDir, "history.tsv")
+
+    // سجل غير محدود: سطر لكل صفحة في ملف (إضافة في نهاية الملف دون إعادة كتابته)
+    private fun addHistory(title: String, url: String) {
+        if (!url.startsWith("http")) return
+        if (url == lastHist) return
+        lastHist = url
+        val t = title.replace("\t", " ").replace("\n", " ").replace("\r", " ")
+        val line = System.currentTimeMillis().toString() + "\t" + t + "\t" + url + "\n"
+        imgPool.execute {
+            try {
+                synchronized(histLock) { histFile().appendText(line) }
+            } catch (e: Throwable) {
+            }
+        }
+    }
+
+    private fun clearHistory() {
+        lastHist = ""
+        imgPool.execute {
+            try {
+                synchronized(histLock) { histFile().delete() }
+            } catch (e: Throwable) {
+            }
+        }
+    }
+
+    private fun showHistory() {
+        val urls = ArrayList<String>()
+        val labels = ArrayList<String>()
+        try {
+            val f = histFile()
+            if (f.exists()) {
+                val lines = synchronized(histLock) { f.readLines() }
+                for (k in lines.indices.reversed()) {
+                    val p = lines[k].split("\t")
+                    if (p.size < 3) continue
+                    val u = p[2]
+                    val t = p[1].ifBlank { hostOf(u) }
+                    urls.add(u)
+                    labels.add(t.take(50) + "\n" + u.take(60))
+                }
+            }
+        } catch (e: Throwable) {
+        }
+        val b = AlertDialog.Builder(this).setTitle("سجل التصفح (" + urls.size + ")")
+        if (urls.isEmpty()) b.setMessage("السجل فارغ") else b.setItems(labels.toTypedArray()) { _, i -> load(urls[i]) }
+        if (urls.isNotEmpty()) b.setNeutralButton("مسح السجل") { _, _ ->
+            clearHistory()
+            toast("تم مسح السجل")
+        }
+        b.setNegativeButton("رجوع", null)
+        b.show()
+    }
+
+    // ---------- البحث داخل الصفحة ----------
+
+    private fun buildFindBar(): View {
+        findBar = LinearLayout(this)
+        findBar.orientation = LinearLayout.HORIZONTAL
+        findBar.gravity = Gravity.CENTER_VERTICAL
+        findBar.setBackgroundColor(cBar)
+        findBar.setPadding(dp(8), dp(4), dp(8), dp(4))
+        findBar.visibility = View.GONE
+        findBox = EditText(this)
+        findBox.setTextColor(cText)
+        findBox.setHintTextColor(cMuted)
+        findBox.hint = "بحث داخل الصفحة"
+        findBox.textSize = 14f
+        findBox.setSingleLine()
+        findBox.background = bg(cCard, 18, cLine)
+        findBox.setPadding(dp(12), dp(6), dp(12), dp(6))
+        findBox.imeOptions = EditorInfo.IME_ACTION_SEARCH
+        findBox.setOnEditorActionListener { _, _, _ ->
+            cur?.web?.findNext(true)
+            true
+        }
+        findBox.addTextChangedListener(object : TextWatcher {
+            override fun beforeTextChanged(s: CharSequence?, st: Int, c: Int, a: Int) {}
+            override fun onTextChanged(s: CharSequence?, st: Int, b: Int, c: Int) {}
+            override fun afterTextChanged(s: Editable?) {
+                val q = s?.toString() ?: ""
+                val w = cur?.web
+                if (q.isEmpty()) {
+                    w?.clearMatches()
+                    findCount.text = ""
+                } else w?.findAllAsync(q)
+            }
+        })
+        findCount = tv("", 12f, cMuted)
+        findCount.minWidth = dp(34)
+        findCount.gravity = Gravity.CENTER
+        val up = pill("▲", false) { cur?.web?.findNext(false) }
+        val dn = pill("▼", false) { cur?.web?.findNext(true) }
+        up.setPadding(dp(10), dp(6), dp(10), dp(6))
+        dn.setPadding(dp(10), dp(6), dp(10), dp(6))
+        findBar.addView(findBox, lp(0, WRAP, 1f))
+        findBar.addView(findCount)
+        findBar.addView(up, lp(WRAP, WRAP, 0f, 2, 0, 2, 0))
+        findBar.addView(dn, lp(WRAP, WRAP, 0f, 2, 0, 2, 0))
+        findBar.addView(iconBtn(R.drawable.ic_close) { closeFind() }, lp(dp(36), dp(36)))
+        return findBar
+    }
+
+    private fun openFind() {
+        showPage(0)
+        findBar.visibility = View.VISIBLE
+        findBox.requestFocus()
+        findBox.postDelayed({
+            val im = getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
+            im.showSoftInput(findBox, 0)
+        }, 150)
+    }
+
+    private fun closeFind() {
+        findBox.setText("")
+        findCount.text = ""
+        cur?.web?.clearMatches()
+        findBar.visibility = View.GONE
+        hideKb()
     }
 
     // ---------- المتصفح والتبويبات ----------
@@ -845,13 +1730,26 @@ class MainActivity : Activity() {
         CookieManager.getInstance().setAcceptCookie(true)
         CookieManager.getInstance().setAcceptThirdPartyCookies(w, true)
         w.addJavascriptInterface(Bridge(), "TDL")
+        // حقن مبكر في كل الإطارات (بما فيها iframe) قبل أي سكربت للصفحة، فلا يفوتنا fetch/XHR أثناء التحميل
+        try {
+            if (prefs().getBoolean("overlay", true) &&
+                androidx.webkit.WebViewFeature.isFeatureSupported(androidx.webkit.WebViewFeature.DOCUMENT_START_SCRIPT)) {
+                androidx.webkit.WebViewCompat.addDocumentStartJavaScript(w, hookJs(), setOf("*"))
+            }
+        } catch (e: Throwable) {
+            logErr("التقاط", "تعذر تفعيل الحقن المبكر: " + (e.message ?: e.javaClass.simpleName), e)
+        }
+        w.setOnLongClickListener { v -> onWebLongPress(v as WebView) }
+        w.setFindListener { active, count, _ ->
+            if (cur?.web === w) findCount.text = if (count > 0) "" + (active + 1) + "/" + count else "0"
+        }
         w.webChromeClient = object : WebChromeClient() {
             override fun onProgressChanged(v: WebView, p: Int) {
                 val t = hasTab(v) ?: return
                 t.progress = p
                 if (p >= 20 && !t.injected) {
                     t.injected = true
-                    if (prefs().getBoolean("overlay", true)) v.evaluateJavascript(OVERLAY_JS, null)
+                    if (prefs().getBoolean("overlay", true)) v.evaluateJavascript(overlayJs(), null)
                 }
                 if (cur === t) updateLoadUi()
             }
@@ -861,10 +1759,75 @@ class MainActivity : Activity() {
                 t.title = title ?: ""
                 relabel()
             }
+
+            // رفع الملفات من المواقع (الصور والمستندات والكاميرا)
+            override fun onShowFileChooser(v: WebView, cb: ValueCallback<Array<Uri>>, p: WebChromeClient.FileChooserParams): Boolean {
+                fileCb?.onReceiveValue(null)
+                fileCb = cb
+                return try {
+                    startActivityForResult(p.createIntent(), 77)
+                    true
+                } catch (e: Throwable) {
+                    fileCb = null
+                    toast("تعذر فتح منتقي الملفات")
+                    false
+                }
+            }
+
+            // الكاميرا والميكروفون للمواقع
+            override fun onPermissionRequest(r: PermissionRequest) {
+                ui.post { askWebPermission(r) }
+            }
+
+            // الموقع الجغرافي للمواقع
+            override fun onGeolocationPermissionsShowPrompt(origin: String, cb: GeolocationPermissions.Callback) {
+                if (Build.VERSION.SDK_INT >= 23 && checkSelfPermission(android.Manifest.permission.ACCESS_FINE_LOCATION) != android.content.pm.PackageManager.PERMISSION_GRANTED) {
+                    geoCb = cb
+                    geoOrigin = origin
+                    requestPermissions(arrayOf(android.Manifest.permission.ACCESS_FINE_LOCATION, android.Manifest.permission.ACCESS_COARSE_LOCATION), 78)
+                } else cb.invoke(origin, true, false)
+            }
+
+            // الفيديو بملء الشاشة
+            override fun onShowCustomView(view: View, cb: WebChromeClient.CustomViewCallback) {
+                showFull(view, cb)
+            }
+
+            override fun onHideCustomView() {
+                hideFull()
+            }
+
+            // النوافذ المنبثقة (window.open) تُفتح في تبويب جديد
+            override fun onCreateWindow(v: WebView, isDialog: Boolean, isUserGesture: Boolean, resultMsg: android.os.Message?): Boolean {
+                val msg = resultMsg ?: return false
+                val tr = msg.obj as? WebView.WebViewTransport ?: return false
+                val tmp = WebView(this@MainActivity)
+                tmp.webViewClient = object : WebViewClient() {
+                    override fun shouldOverrideUrlLoading(x: WebView, r: WebResourceRequest): Boolean {
+                        val u = r.url.toString()
+                        ui.post { newTab(u) }
+                        try { x.destroy() } catch (e: Throwable) {}
+                        return true
+                    }
+                }
+                tr.webView = tmp
+                msg.sendToTarget()
+                return true
+            }
         }
+        // تحميل أي ملف من أي موقع (zip و apk و pdf وغيرها) بمحرك التطبيق السريع
+        w.setDownloadListener { url, ua, cd, mime, len -> ui.post { onWebDownload(url, ua, cd, mime, len) } }
         w.webViewClient = object : WebViewClient() {
             // يعمل على خيط الشبكة: لا نلمس WebView هنا، كل شيء من نفس الطلب
             override fun shouldInterceptRequest(v: WebView, r: WebResourceRequest): WebResourceResponse? {
+                return try {
+                    intercept(v, r)
+                } catch (e: Throwable) {
+                    null // أي خطأ هنا كان يوقف التطبيق كله؛ نترك الطلب يمر طبيعياً
+                }
+            }
+
+            private fun intercept(v: WebView, r: WebResourceRequest): WebResourceResponse? {
                 val u = r.url.toString()
                 val low = u.lowercase()
                 val h = HashMap<String, String>()
@@ -874,8 +1837,12 @@ class MainActivity : Activity() {
                 val origin = hdr(r.requestHeaders, "Origin")
                 if (origin != null) h["Origin"] = origin
                 val accept = (hdr(r.requestHeaders, "Accept") ?: "").lowercase()
-                if (low.contains(".m3u8") || low.contains(".mp4") || low.contains("mpegurl") || accept.contains("mpegurl")) {
-                    ui.post { addFound(u, h) }
+                val pathOnly = low.substringBefore('?').substringBefore('#')
+                if (low.contains(".m3u8") || low.contains("mpegurl") || accept.contains("mpegurl") ||
+                    accept.contains("dash+xml") || pathOnly.endsWith(".mpd") ||
+                    videoExt.any { pathOnly.endsWith(it) } || low.contains(".mp4") ||
+                    (capAudio() && audioExt.any { pathOnly.endsWith(it) }) || (capSeg() && segExt.any { pathOnly.endsWith(it) })) {
+                    ui.post { consider(u, h, v) }
                     return null
                 }
                 if (adBlock) {
@@ -886,28 +1853,75 @@ class MainActivity : Activity() {
                         }
                     }
                 }
+                if (rcWanted(r, low, accept)) {
+                    val rs = rcServe(u, h)
+                    if (rs != null) return rs
+                }
                 // نوع المحتوى mpegurl: فحص رأس الرد للطلبات التي لا تبدو ملفات ثابتة
                 if (r.method == "GET" && !r.isForMainFrame && (r.url.scheme == "http" || r.url.scheme == "https") &&
                     staticExt.none { low.substringBefore('?').endsWith(it) }) {
-                    probe(u, h)
+                    probe(u, h, v)
                 }
                 return null
             }
 
             override fun shouldOverrideUrlLoading(v: WebView, r: WebResourceRequest): Boolean {
-                val s = r.url.scheme ?: ""
-                return !(s == "http" || s == "https")
+                val s = (r.url.scheme ?: "").lowercase()
+                if (s == "http" || s == "https" || s == "about" || s == "file" || s == "content" || s == "data" || s == "blob" || s == "javascript") return false
+                try {
+                    val i = if (s == "intent") Intent.parseUri(r.url.toString(), Intent.URI_INTENT_SCHEME) else Intent(Intent.ACTION_VIEW, r.url)
+                    i.addCategory(Intent.CATEGORY_BROWSABLE)
+                    i.component = null
+                    i.selector = null
+                    startActivity(i)
+                } catch (e: Throwable) {
+                }
+                return true
             }
 
             override fun onPageStarted(v: WebView, url: String, f: android.graphics.Bitmap?) {
                 pages[v] = url
                 val t = hasTab(v) ?: return
+                t.lastUrl = url.substringBefore('#')
+                t.scanning = false
+                pruneTab(t)
+                if (t.start) {
+                    t.start = false
+                    if (cur === t) updateStart()
+                }
                 t.loading = true
                 t.injected = false
                 t.progress = 5
+                if (prefs().getBoolean("overlay", true)) v.evaluateJavascript(hookJs(), null)
+                val pto = prefs().getInt("pgtimeout", 0)
+                if (pto > 0) {
+                    val key = url.substringBefore('#')
+                    ui.postDelayed({
+                        if (tabs.contains(t) && t.loading && t.lastUrl == key && t.progress < 100) {
+                            try { t.web.stopLoading() } catch (e: Throwable) {}
+                            t.loading = false
+                            if (cur === t) {
+                                updateLoadUi()
+                                toast("تم إيقاف تحميل الصفحة لتجاوز المهلة")
+                            }
+                        }
+                    }, pto * 1000L)
+                }
                 if (cur === t) {
                     urlBox.setText(url)
                     updateLoadUi()
+                }
+            }
+
+            // صفحات تغيّر عنوانها بدون إعادة تحميل (SPA): نمسح روابط الفيديو غير المبدوءة للصفحة السابقة
+            override fun doUpdateVisitedHistory(v: WebView, url: String, isReload: Boolean) {
+                val t = hasTab(v) ?: return
+                val nu = url.substringBefore('#')
+                if (!isReload && t.lastUrl.isNotEmpty() && nu != t.lastUrl) {
+                    t.lastUrl = nu
+                    if (!t.scanning) pruneTab(t)
+                } else if (t.lastUrl.isEmpty()) {
+                    t.lastUrl = nu
                 }
             }
 
@@ -916,6 +1930,7 @@ class MainActivity : Activity() {
                 t.loading = false
                 t.progress = 100
                 t.title = v.title ?: t.title
+                addHistory(t.title, url)
                 relabel()
                 if (cur === t) updateLoadUi()
                 CookieManager.getInstance().flush()
@@ -923,7 +1938,7 @@ class MainActivity : Activity() {
                     t.restoring = false
                     v.settings.cacheMode = baseCache()
                 }
-                if (prefs().getBoolean("overlay", true)) v.evaluateJavascript(OVERLAY_JS, null)
+                if (prefs().getBoolean("overlay", true)) v.evaluateJavascript(overlayJs(), null)
                 runScripts(v, url)
             }
 
@@ -947,20 +1962,41 @@ class MainActivity : Activity() {
                 val t = hasTab(v)
                 val u = pages[v] ?: HOME
                 logErr("WebView", "تعطلت عملية عرض الصفحة " + (if (d.didCrash()) "(انهيار)" else "(نفاد الذاكرة)") + ": " + u)
-                if (t != null) {
-                    ui.post {
-                        if (tabs.size <= 1) {
-                            removeTab(t)
-                            newTab(u)
-                        } else {
-                            closeTab(t)
-                        }
-                    }
-                }
+                if (t != null) ui.post { recoverTab(t, v, u) }
                 return true
             }
         }
         return w
+    }
+
+    // استبدال WebView المنهار داخل نفس التبويب بدل إغلاق التبويبات (كل التبويبات تشترك في عملية عرض واحدة)
+    private fun recoverTab(t: Tab, dead: WebView, url: String) {
+        if (t.web !== dead || !tabs.contains(t)) return
+        val wasCur = cur === t
+        val idx = container.indexOfChild(dead)
+        pages.remove(dead)
+        try { container.removeView(dead) } catch (e: Throwable) {}
+        try { dead.destroy() } catch (e: Throwable) {}
+        val nw = makeWeb()
+        t.web = nw
+        t.loading = false
+        t.progress = 0
+        t.injected = false
+        container.addView(nw, if (idx >= 0) idx else container.childCount, FrameLayout.LayoutParams(MATCH, MATCH))
+        nw.visibility = if (wasCur) View.VISIBLE else View.GONE
+        val now = System.currentTimeMillis()
+        val loop = now - t.lastCrash < 4000 // انهيار متكرر: لا نعيد التحميل تلقائياً لتجنب حلقة انهيار
+        t.lastCrash = now
+        if (url.startsWith("http") && !loop) {
+            if (wasCur) nw.loadUrl(url) else t.pendingUrl = url
+        } else {
+            toast("تعذر عرض الصفحة بسبب نقص الذاكرة. أغلق بعض التبويبات وأعد المحاولة")
+        }
+        if (wasCur) {
+            urlBox.setText(url)
+            updateLoadUi()
+        }
+        relabel()
     }
 
     private fun buildChip(t: Tab) {
@@ -992,6 +2028,7 @@ class MainActivity : Activity() {
     private fun newTab(url: String) {
         val t = Tab(makeWeb())
         buildChip(t)
+        if (url.isBlank()) t.start = true
         tabs.add(t)
         container.addView(t.web, FrameLayout.LayoutParams(MATCH, MATCH))
         tabsRow.addView(t.chip, tabsRow.childCount - 1)
@@ -1006,7 +2043,8 @@ class MainActivity : Activity() {
         tabs.remove(t)
         container.removeView(t.web)
         tabsRow.removeView(t.chip)
-        t.web.destroy()
+        pages.remove(t.web)
+        try { t.web.destroy() } catch (e: Throwable) {}
     }
 
     private fun closeTab(t: Tab) {
@@ -1021,26 +2059,399 @@ class MainActivity : Activity() {
         if (wasCur) switchTo(tabs[if (i > 0) i - 1 else 0])
     }
 
+    private fun moveTab(from: Int, to: Int) {
+        if (from == to || from !in tabs.indices) return
+        val t = tabs.removeAt(from)
+        val ti = to.coerceIn(0, tabs.size)
+        tabs.add(ti, t)
+        tabsRow.removeView(t.chip)
+        tabsRow.addView(t.chip, ti)
+        relabel()
+    }
+
+    // مدير التبويبات: اسحب بالضغط المطول لتغيير المكان بحرية، أو استخدم الأسهم
     private fun showTabs() {
-        val items = Array(tabs.size) { i ->
-            val t = tabs[i]
-            (if (t === cur) "● " else "○ ") + (if (t.title.isNotBlank()) t.title else (t.web.url ?: ("تبويب " + (i + 1)))).take(50)
+        val box = LinearLayout(this)
+        box.orientation = LinearLayout.VERTICAL
+        box.layoutDirection = View.LAYOUT_DIRECTION_RTL
+        box.setPadding(dp(10), dp(6), dp(10), dp(6))
+        val sv = ScrollView(this)
+        sv.addView(box)
+        val dlgRef = arrayOfNulls<AlertDialog>(1)
+
+        fun fill() {
+            box.removeAllViews()
+            dlgRef[0]?.setTitle("التبويبات (" + tabs.size + ")")
+            box.addView(tv("اضغط مطولاً على تبويب ثم اسحبه لتغيير مكانه", 12f, cMuted), lp(MATCH, WRAP, 0f, 0, 0, 0, 8))
+            for (i in tabs.indices) {
+                val t = tabs[i]
+                val row = LinearLayout(this)
+                row.orientation = LinearLayout.HORIZONTAL
+                row.gravity = Gravity.CENTER_VERTICAL
+                row.background = bg(if (t === cur) cAccentSoft else cCard, 12, if (t === cur) cAccent else cLine)
+                row.setPadding(dp(10), dp(6), dp(6), dp(6))
+                val handle = tv("☰", 16f, cMuted, true)
+                handle.setPadding(0, 0, dp(10), 0)
+                val title = tv(
+                    (if (t.title.isNotBlank()) t.title else (t.web.url ?: ("تبويب " + (i + 1)))).take(50),
+                    14f, cText, t === cur
+                )
+                title.maxLines = 1
+                title.ellipsize = TextUtils.TruncateAt.END
+                title.setOnClickListener {
+                    dlgRef[0]?.dismiss()
+                    switchTo(t)
+                    showPage(0)
+                }
+                fun small(txt: String, f: () -> Unit): TextView {
+                    val b = tv(txt, 16f, cAccent, true)
+                    b.gravity = Gravity.CENTER
+                    b.setPadding(dp(10), dp(6), dp(10), dp(6))
+                    b.setOnClickListener { f() }
+                    return b
+                }
+                row.addView(handle)
+                row.addView(title, lp(0, WRAP, 1f))
+                row.addView(small("▲") { moveTab(i, i - 1); fill() })
+                row.addView(small("▼") { moveTab(i, i + 1); fill() })
+                row.addView(small("✕") {
+                    val n = tabs.size
+                    closeTab(t)
+                    if (tabs.size != n) fill()
+                })
+                row.setOnLongClickListener { v ->
+                    v.alpha = 0.4f
+                    v.startDragAndDrop(ClipData.newPlainText("tab", "" + i), View.DragShadowBuilder(v), t, 0)
+                    true
+                }
+                box.addView(row, lp(MATCH, WRAP, 0f, 0, 0, 0, 6))
+            }
         }
+
+        box.setOnDragListener { _, ev ->
+            when (ev.action) {
+                android.view.DragEvent.ACTION_DRAG_STARTED -> true
+                android.view.DragEvent.ACTION_DRAG_LOCATION -> {
+                    val ly = ev.y - sv.scrollY
+                    if (ly < dp(48)) sv.scrollBy(0, -dp(14))
+                    else if (ly > sv.height - dp(48)) sv.scrollBy(0, dp(14))
+                    true
+                }
+                android.view.DragEvent.ACTION_DROP -> {
+                    val moved = ev.localState as? Tab
+                    if (moved != null) {
+                        val from = tabs.indexOf(moved)
+                        var to = tabs.size - 1
+                        for (k in 1 until box.childCount) {
+                            if (ev.y < box.getChildAt(k).bottom) {
+                                to = k - 1
+                                break
+                            }
+                        }
+                        moveTab(from, to)
+                    }
+                    true
+                }
+                android.view.DragEvent.ACTION_DRAG_ENDED -> {
+                    fill()
+                    true
+                }
+                else -> true
+            }
+        }
+
         val dlg = AlertDialog.Builder(this)
             .setTitle("التبويبات (" + tabs.size + ")")
-            .setItems(items) { _, i ->
-                switchTo(tabs[i])
-                showPage(0)
-            }
-            .setPositiveButton("تبويب جديد") { _, _ -> newTab(prefs().getString("home", HOME) ?: HOME) }
-            .setNeutralButton("إغلاق الحالي") { _, _ -> cur?.let { closeTab(it) } }
+            .setView(sv)
+            .setPositiveButton("تبويب جديد") { _, _ -> newHomeTab() }
+            .setNeutralButton("إغلاق الأخرى") { _, _ -> closeOthers() }
             .setNegativeButton("رجوع", null)
-            .show()
-        dlg.listView.setOnItemLongClickListener { _, _, i, _ ->
-            if (i in tabs.indices) closeTab(tabs[i])
-            dlg.dismiss()
-            true
+            .create()
+        dlgRef[0] = dlg
+        fill()
+        dlg.show()
+    }
+
+    // ---------- أدوات مساعدة ----------
+
+    private fun clipText(): String = try {
+        val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+        val c = cm.primaryClip
+        if (c != null && c.itemCount > 0) (c.getItemAt(0).coerceToText(this)?.toString() ?: "").trim() else ""
+    } catch (e: Throwable) {
+        ""
+    }
+
+    private fun downloadFromClip() {
+        val u = clipText()
+        if (!(u.startsWith("http://") || u.startsWith("https://"))) {
+            toast("لا يوجد رابط في الحافظة")
+            return
         }
+        manualBox.setText(u)
+        addManual()
+    }
+
+    private fun openFromClip() {
+        val u = clipText()
+        if (u.isBlank()) {
+            toast("الحافظة فارغة")
+            return
+        }
+        newTab(u)
+    }
+
+    private fun copyFound() {
+        if (found.isEmpty()) toast("لا توجد روابط ملتقطة") else copyText(found.joinToString("\n"))
+    }
+
+    private fun shareFound() {
+        if (found.isEmpty()) {
+            toast("لا توجد روابط ملتقطة")
+            return
+        }
+        val i = Intent(Intent.ACTION_SEND)
+        i.type = "text/plain"
+        i.putExtra(Intent.EXTRA_TEXT, found.joinToString("\n"))
+        startActivity(Intent.createChooser(i, "مشاركة الروابط"))
+    }
+
+    private fun copyTabs() {
+        val l = tabs.mapNotNull { it.web.url }.filter { it.startsWith("http") }
+        if (l.isEmpty()) toast("لا توجد روابط") else copyText(l.joinToString("\n"))
+    }
+
+    private fun freeMem() {
+        for (t in tabs) if (t !== cur) try { t.web.clearCache(false) } catch (e: Throwable) {}
+        System.gc()
+        toast("تم تفريغ الذاكرة")
+    }
+
+    private fun perfReport() {
+        val rt = Runtime.getRuntime()
+        val used = (rt.totalMemory() - rt.freeMemory()) / 1048576
+        val mx = rt.maxMemory() / 1048576
+        val lim = prefs().getInt("limitkb", 0)
+        val msg = "التبويبات المفتوحة: " + tabs.size +
+            "\nتحميلات جارية: " + activeBox.childCount +
+            "\nروابط ملتقطة: " + found.size +
+            "\nمخزن الصور: " + rcSizeMb() + " م.ب" +
+            "\nذاكرة التطبيق: " + used + " / " + mx + " م.ب" +
+            "\nحد السرعة: " + (if (lim > 0) "" + lim + " ك.ب/ث" else "بلا حد") +
+            "\nالتحميلات المتزامنة: " + prefs().getInt("parallel", 3) +
+            "\nالأجزاء المتوازية: " + prefs().getInt("threads", 8)
+        AlertDialog.Builder(this).setTitle("تقرير الأداء").setMessage(msg)
+            .setPositiveButton("تفريغ الذاكرة") { _, _ -> freeMem() }
+            .setNegativeButton("رجوع", null).show()
+    }
+
+    private fun applyParallel() {
+        val n = prefs().getInt("parallel", 3).coerceIn(1, 32)
+        try {
+            if (n > queue.maximumPoolSize) {
+                queue.maximumPoolSize = n
+                queue.corePoolSize = n
+            } else {
+                queue.corePoolSize = n
+                queue.maximumPoolSize = n
+            }
+        } catch (e: Throwable) {
+        }
+    }
+
+    // يحدّ سرعة التحميل الكلية (ك.ب/ث) بتأخير الخيط بما يناسب حجم ما قُرئ
+    private fun throttle(n: Int) {
+        val lim = limitKb
+        if (lim <= 0 || n <= 0) return
+        val ms: Long
+        synchronized(thrLock) {
+            val now = System.nanoTime()
+            if (thrNext < now) thrNext = now
+            thrNext += n * 1000000000L / (lim * 1024L)
+            ms = (thrNext - now) / 1000000L
+        }
+        if (ms > 0) try { Thread.sleep(minOf(ms, 2000L)) } catch (e: InterruptedException) {}
+    }
+
+    // ---------- مخزن الصور الخاص (يحفظ كل صورة وأيقونة على الجهاز بغض النظر عن منع الموقع) ----------
+
+    private val rcDir: File by lazy { File(cacheDir, "rc").also { it.mkdirs() } }
+    private val rcExt = listOf(".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".ico", ".avif", ".bmp", ".woff", ".woff2", ".ttf")
+    private val rcWrites = AtomicInteger(0)
+
+    private fun rcKey(u: String): String {
+        val d = java.security.MessageDigest.getInstance("SHA-1").digest(u.toByteArray())
+        return d.joinToString("") { String.format("%02x", it) }
+    }
+
+    private fun rcWanted(r: WebResourceRequest, low: String, accept: String): Boolean {
+        if (!prefs().getBoolean("rescache", true)) return false
+        if (r.method != "GET" || r.isForMainFrame) return false
+        val sc = r.url.scheme ?: return false
+        if (sc != "http" && sc != "https") return false
+        if (hdr(r.requestHeaders, "Range") != null) return false
+        val path = low.substringBefore('?').substringBefore('#')
+        if (rcExt.any { path.endsWith(it) }) return true
+        return accept.contains("image/") && !accept.contains("text/html")
+    }
+
+    private fun rcResponse(ct: String, st: java.io.InputStream): WebResourceResponse {
+        val hd = HashMap<String, String>()
+        hd["Access-Control-Allow-Origin"] = "*"
+        hd["Cache-Control"] = "max-age=86400"
+        return WebResourceResponse(ct.ifEmpty { "image/jpeg" }, null, 200, "OK", hd, st)
+    }
+
+    // يعمل على خيط الشبكة؛ أي فشل يعيد null فيتولى المتصفح الطلب بنفسه
+    private fun rcServe(u: String, h: Map<String, String>): WebResourceResponse? {
+        val key = rcKey(u)
+        val bin = File(rcDir, key + ".bin")
+        val meta = File(rcDir, key + ".meta")
+        if (bin.exists() && meta.exists()) {
+            try {
+                val m = meta.readText().split("\n")
+                bin.setLastModified(System.currentTimeMillis())
+                return rcResponse(m[0], java.io.FileInputStream(bin))
+            } catch (e: Throwable) {
+            }
+        }
+        return try {
+            val c = conn(u, h)
+            val ct = (c.contentType ?: "").substringBefore(';').trim()
+            val tmp = File(rcDir, key + "_" + Thread.currentThread().id + ".tmp")
+            var size = 0L
+            c.inputStream.use { i ->
+                tmp.outputStream().use { o ->
+                    val buf = ByteArray(16384)
+                    while (true) {
+                        val n = i.read(buf)
+                        if (n < 0) break
+                        o.write(buf, 0, n)
+                        size += n
+                    }
+                }
+            }
+            val okType = ct.startsWith("image/") || ct.startsWith("font/") || ct.contains("font")
+            if (okType && size > 0) {
+                meta.writeText(ct + "\n" + System.currentTimeMillis())
+                bin.delete()
+                if (tmp.renameTo(bin)) {
+                    if (rcWrites.incrementAndGet() % 40 == 0) rcTrim()
+                    return rcResponse(ct, java.io.FileInputStream(bin))
+                }
+            }
+            val st = java.io.FileInputStream(tmp)
+            tmp.delete()
+            rcResponse(ct, st)
+        } catch (e: Throwable) {
+            null
+        }
+    }
+
+    private fun rcTrim() {
+        try {
+            val maxB = prefs().getInt("rcmb", 0) * 1048576L
+            if (maxB <= 0) return
+            val fs = rcDir.listFiles() ?: return
+            var total = 0L
+            for (f in fs) total += f.length()
+            if (total <= maxB) return
+            val bins = fs.filter { it.name.endsWith(".bin") }.sortedBy { it.lastModified() }
+            for (b in bins) {
+                if (total <= maxB * 8 / 10) break
+                val m = File(rcDir, b.name.removeSuffix(".bin") + ".meta")
+                total -= b.length() + m.length()
+                b.delete()
+                m.delete()
+            }
+        } catch (e: Throwable) {
+        }
+    }
+
+    private fun rcSizeMb(): Long {
+        var total = 0L
+        try { rcDir.listFiles()?.forEach { total += it.length() } } catch (e: Throwable) {}
+        return total / 1048576
+    }
+
+    private fun rcClear() {
+        try { rcDir.listFiles()?.forEach { it.delete() } } catch (e: Throwable) {}
+        toast("تم مسح مخزن الصور")
+    }
+
+    // خانة رقم حرة: تكتب أي قيمة تريدها، والصفر يعني بلا حد (أو تلقائي حسب الوصف)
+    private fun numRow(parent: LinearLayout, title: String, sub0: String, key: String, def: Int, zeroLabel: String = "بلا حد", onChange: (Int) -> Unit = {}) {
+        val sub = sub0.replace(Regex("\\s*الصفر:[^.]*\\.?"), "").trim()
+        fun label(v: Int) = if (v == 0 && zeroLabel.isNotEmpty()) zeroLabel else v.toString()
+        val holder = arrayOfNulls<TextView>(1)
+        val p = pill(label(prefs().getInt(key, def)), false) {
+            val cur0 = prefs().getInt(key, def)
+            val et = EditText(this)
+            et.inputType = android.text.InputType.TYPE_CLASS_NUMBER
+            et.setText((if (cur0 > 0) cur0 else (if (def > 0) def else 100)).toString())
+            et.setSelection(et.text.length)
+            val box = LinearLayout(this)
+            box.orientation = LinearLayout.VERTICAL
+            box.setPadding(dp(20), dp(8), dp(20), dp(4))
+            if (sub.isNotEmpty()) box.addView(tv(sub, 13f, cText))
+            val cb = android.widget.CheckBox(this)
+            cb.text = zeroLabel
+            cb.isChecked = cur0 == 0 && zeroLabel.isNotEmpty()
+            et.visibility = if (cb.isChecked) View.GONE else View.VISIBLE
+            cb.setOnCheckedChangeListener { _, on -> et.visibility = if (on) View.GONE else View.VISIBLE }
+            if (zeroLabel.isNotEmpty()) box.addView(cb)
+            box.addView(et)
+            AlertDialog.Builder(this).setTitle(title).setView(box)
+                .setPositiveButton("حفظ") { _, _ ->
+                    val n = if (zeroLabel.isNotEmpty() && cb.isChecked) 0 else (et.text.toString().trim().toLongOrNull() ?: def.toLong()).coerceIn(1L, Int.MAX_VALUE.toLong()).toInt()
+                    prefs().edit().putInt(key, n).apply()
+                    holder[0]?.text = label(n)
+                    onChange(n)
+                }
+                .setNeutralButton("الأصل") { _, _ ->
+                    prefs().edit().putInt(key, def).apply()
+                    holder[0]?.text = label(def)
+                    onChange(def)
+                }
+                .setNegativeButton("إلغاء", null).show()
+        }
+        holder[0] = p
+        val row = LinearLayout(this)
+        row.orientation = LinearLayout.HORIZONTAL
+        row.gravity = Gravity.CENTER_VERTICAL
+        row.setPadding(0, dp(8), 0, dp(8))
+        val txt = LinearLayout(this)
+        txt.orientation = LinearLayout.VERTICAL
+        txt.addView(tv(title, 15f, cText, true))
+        if (sub.isNotEmpty()) txt.addView(tv(sub, 12f, cMuted))
+        row.addView(txt, lp(0, WRAP, 1f))
+        row.addView(p)
+        parent.addView(row, lp(MATCH, WRAP))
+    }
+
+    private fun choiceRow(parent: LinearLayout, title: String, sub: String, key: String, labels: Array<String>, values: IntArray, def: Int, onChange: (Int) -> Unit = {}) {
+        val cur0 = prefs().getInt(key, def)
+        val idx = values.indexOf(cur0)
+        val holder = arrayOfNulls<TextView>(1)
+        val p = pill(labels[if (idx >= 0) idx else 0], false) {
+            AlertDialog.Builder(this).setTitle(title).setItems(labels) { _, i ->
+                prefs().edit().putInt(key, values[i]).apply()
+                holder[0]?.text = labels[i]
+                onChange(values[i])
+            }.show()
+        }
+        holder[0] = p
+        val row = LinearLayout(this)
+        row.orientation = LinearLayout.HORIZONTAL
+        row.gravity = Gravity.CENTER_VERTICAL
+        row.setPadding(0, dp(8), 0, dp(8))
+        val txt = LinearLayout(this)
+        txt.orientation = LinearLayout.VERTICAL
+        txt.addView(tv(title, 15f, cText, true))
+        if (sub.isNotEmpty()) txt.addView(tv(sub, 12f, cMuted))
+        row.addView(txt, lp(0, WRAP, 1f))
+        row.addView(p)
+        parent.addView(row, lp(MATCH, WRAP))
     }
 
     private fun closeOthers() {
@@ -1052,7 +2463,8 @@ class MainActivity : Activity() {
     }
 
     private fun relabel() {
-        tabBtn.text = "" + tabs.size
+        tabBtn.text = if (tabs.size > 99) "99+" else "" + tabs.size
+        tabBtn.textSize = if (tabs.size > 99) 8f else if (tabs.size > 9) 10f else 12f
         for (i in tabs.indices) {
             val t = tabs[i]
             t.label.text = if (t.title.isNotBlank()) t.title else "تبويب " + (i + 1)
@@ -1064,46 +2476,76 @@ class MainActivity : Activity() {
         cur = t
         for (x in tabs) {
             x.web.visibility = if (x === t) View.VISIBLE else View.GONE
+            if (prefs().getBoolean("pausebg", true) && x !== t) x.web.onPause() else x.web.onResume()
             x.chip.background = bg(if (x === t) cAccentSoft else cCard, 16, if (x === t) cAccent else cLine)
         }
-        urlBox.setText(t.web.url ?: "")
+        val pu = t.pendingUrl
+        if (pu != null) {
+            t.pendingUrl = null
+            t.web.loadUrl(pu)
+        }
+        urlBox.setText(t.web.url ?: pu ?: "")
+        if (findBar.visibility == View.VISIBLE) closeFind()
+        updateStart()
         updateLoadUi()
+        updateCounts()
     }
 
     private fun fix(u: String): String {
         val s = u.trim()
         if (s.startsWith("http://") || s.startsWith("https://")) return s
-        if (s.contains(" ") || !s.contains(".")) return "https://www.google.com/search?q=" + URLEncoder.encode(s, "UTF-8")
+        if (s.contains(" ") || !s.contains(".")) return searchUrl(s)
         return "https://$s"
     }
 
     private fun load(u: String) {
         hideKb()
+        cur?.start = false
+        updateStart()
         cur?.web?.loadUrl(fix(u))
         showPage(0)
     }
 
     // ---------- المفضلة ----------
 
+    private fun bookmarkList(): List<String> =
+        (prefs().getStringSet("bm", HashSet<String>()) ?: HashSet<String>()).toList().sorted()
+
     private fun addBookmark() {
-        val u = cur?.web?.url ?: return
+        val u = cur?.web?.url
+        if (u == null) {
+            toast("افتح صفحة أولاً ثم احفظها")
+            return
+        }
         val set = HashSet<String>(prefs().getStringSet("bm", HashSet<String>()) ?: HashSet<String>())
         set.add(u)
         prefs().edit().putStringSet("bm", set).apply()
         toast("تم الحفظ في المفضلة")
+        refreshStart()
+    }
+
+    private fun removeBookmark(u: String) {
+        val set = HashSet<String>(prefs().getStringSet("bm", HashSet<String>()) ?: HashSet<String>())
+        set.remove(u)
+        prefs().edit().putStringSet("bm", set).apply()
+        refreshStart()
     }
 
     private fun showBookmarks() {
-        val items = (prefs().getStringSet("bm", HashSet<String>()) ?: HashSet<String>()).toList().sorted()
-        if (items.isEmpty()) {
-            toast("المفضلة فاضية")
-            return
+        val items = bookmarkList()
+        val b = AlertDialog.Builder(this).setTitle("المفضلة (" + items.size + ")")
+        if (items.isEmpty()) b.setMessage("لا توجد صفحات في المفضلة بعد") else b.setItems(items.toTypedArray()) { _, i -> load(items[i]) }
+        b.setPositiveButton("حفظ الصفحة الحالية") { _, _ -> addBookmark() }
+        if (items.isNotEmpty()) b.setNegativeButton("مسح الكل") { _, _ ->
+            prefs().edit().remove("bm").apply()
+            refreshStart()
         }
-        AlertDialog.Builder(this)
-            .setTitle("المفضلة")
-            .setItems(items.toTypedArray()) { _, i -> load(items[i]) }
-            .setNegativeButton("مسح الكل") { _, _ -> prefs().edit().remove("bm").apply() }
-            .show()
+        val dlg = b.show()
+        if (items.isNotEmpty()) dlg.listView.setOnItemLongClickListener { _, _, i, _ ->
+            if (i in items.indices) removeBookmark(items[i])
+            dlg.dismiss()
+            true
+        }
     }
 
     // ---------- تنبيهات التطبيق ----------
@@ -1446,8 +2888,26 @@ class MainActivity : Activity() {
         @JavascriptInterface
         fun copyVideo(src: String) {
             ui.post {
-                val u = if (src.startsWith("http")) src else found.lastOrNull()
+                val u = if (src.startsWith("http")) src else bestFor(cur)?.url
                 if (u == null) toast("شغّل الفيديو لحظة ثم اضغط مرة أخرى") else copyText(u)
+            }
+        }
+
+        // رابط فيديو اكتشفته الصفحة بنفسها (عنصر video أو fetch/XHR)
+        @JavascriptInterface
+        fun found(src: String, page: String) {
+            if (!src.startsWith("http")) return
+            ui.post { consider(src, hdrFor(src, page), cur?.web) }
+        }
+
+        @JavascriptInterface
+        fun scanDone(n: Int, steps: Int) {
+            ui.post {
+                for (t in tabs) t.scanning = false
+                capNote("فحص", cur?.lastUrl ?: "", "انتهى فحص الصفحة: " + n + " رابط فيديو محتمل بعد " + steps + " خطوة تمرير")
+                w2rescan()
+                toast("انتهى فحص الصفحة: وُجد " + n + " رابط محتمل، راجع تبويب التحميلات")
+                updateCounts()
             }
         }
 
@@ -1459,6 +2919,35 @@ class MainActivity : Activity() {
         @JavascriptInterface
         fun err(msg: String) {
             logErr("فيديو", msg.take(250))
+        }
+
+        // ملفات blob التي تنشئها الصفحة (تصل على أجزاء)
+        @JavascriptInterface
+        fun blobPart(id: String, b64: String) {
+            try {
+                val f = File(cacheDir, "blob_" + id.filter { it.isLetterOrDigit() })
+                FileOutputStream(f, true).use { it.write(android.util.Base64.decode(b64, android.util.Base64.DEFAULT)) }
+            } catch (e: Throwable) {
+                logErr("تحميل", "تعذر استقبال ملف الصفحة: " + (e.message ?: ""))
+            }
+        }
+
+        @JavascriptInterface
+        fun blobEnd(id: String, name: String, mime: String) {
+            val f = File(cacheDir, "blob_" + id.filter { it.isLetterOrDigit() })
+            Thread {
+                try {
+                    if (!f.exists()) throw Exception("لم يصل أي محتوى")
+                    val nm = name.ifBlank { "ملف_" + System.currentTimeMillis() }
+                    FileUtil.saveToDownloads(this@MainActivity, f.inputStream(), nm, if (mime.isNotBlank()) mime else FileUtil.mimeOf(nm))
+                    ui.post { toast("تم حفظ " + nm + " في مجلد التحميلات") }
+                } catch (e: Throwable) {
+                    logErr("تحميل", "تعذر حفظ ملف الصفحة: " + (e.message ?: ""))
+                    ui.post { toast("تعذر حفظ الملف") }
+                } finally {
+                    f.delete()
+                }
+            }.start()
         }
     }
 
@@ -1472,12 +2961,27 @@ class MainActivity : Activity() {
 
     private fun handleVideo(src: String, page: String) {
         // فيديو blob: لا يُحمَّل مباشرة، فنستعمل آخر رابط التقطه التطبيق
-        val u = if (src.startsWith("http")) src else found.lastOrNull()
+        val u = if (src.startsWith("http")) src else bestFor(cur)?.url
         if (u == null) {
-            toast("شغّل الفيديو لحظة ثم اضغط مرة أخرى")
+            // لا رابط ملتقط بعد: نمسح ما حمّلته الصفحة ثم نعيد المحاولة مرة واحدة
+            val w = cur?.web
+            if (w != null && !src.startsWith("http")) {
+                w.evaluateJavascript(RESCAN_JS, null)
+                ui.postDelayed({
+                    val u2 = bestFor(cur)?.url
+                    if (u2 == null) {
+                        if (src.startsWith("blob:")) fetchBlob(src, "video_" + System.currentTimeMillis() + ".mp4", "video/mp4")
+                        else toast("شغّل الفيديو لحظة ثم اضغط مرة أخرى")
+                    } else {
+                        addFound(u2, foundHdr[u2] ?: hdrFor(u2, page), null, cur, cur?.title ?: "")
+                        foundStart[u2]?.invoke()
+                        toast("تابع التحميل من تبويب التحميلات")
+                    }
+                }, 1800)
+            } else toast("شغّل الفيديو لحظة ثم اضغط مرة أخرى")
             return
         }
-        addFound(u, foundHdr[u] ?: hdrFor(u, page))
+        addFound(u, foundHdr[u] ?: hdrFor(u, page), null, cur, cur?.title ?: "")
         foundStart[u]?.invoke()
         toast("تابع التحميل من تبويب التحميلات")
     }
@@ -1489,6 +2993,34 @@ class MainActivity : Activity() {
         if (ct.contains("jpeg") || ct.contains("jpg")) return "jpg"
         val e = src.substringBefore('?').substringAfterLast('.', "").lowercase()
         return if (Regex("[a-z0-9]{2,4}").matches(e)) e else "jpg"
+    }
+
+    // ضغطة مطولة على صورة: نسخ الرابط / مشاركته / تحميل الصورة
+    private fun onWebLongPress(w: WebView): Boolean {
+        val hit = w.hitTestResult
+        val t = hit.type
+        if (t != WebView.HitTestResult.IMAGE_TYPE && t != WebView.HitTestResult.SRC_IMAGE_ANCHOR_TYPE) return false
+        val src = hit.extra ?: return false
+        if (src.isBlank()) return false
+        val pg = w.url ?: ""
+        AlertDialog.Builder(this)
+            .setTitle("الصورة")
+            .setItems(arrayOf("نسخ الرابط", "مشاركة الرابط", "تحميل الصورة")) { _, i ->
+                when (i) {
+                    0 -> handleImage(src, pg, "copy")
+                    1 -> {
+                        if (src.startsWith("http")) {
+                            val sh = Intent(Intent.ACTION_SEND)
+                            sh.type = "text/plain"
+                            sh.putExtra(Intent.EXTRA_TEXT, src)
+                            startActivity(Intent.createChooser(sh, "مشاركة الرابط"))
+                        } else toast("لا يوجد رابط يمكن مشاركته لهذه الصورة")
+                    }
+                    else -> handleImage(src, pg, "dl")
+                }
+            }
+            .show()
+        return true
     }
 
     private fun handleImage(src: String, page: String, act: String) {
@@ -1525,8 +3057,7 @@ class MainActivity : Activity() {
         r.btn.alpha = 0.5f
         r.bar.visibility = View.VISIBLE
         r.msg.text = "في الانتظار..."
-        val low = u.lowercase()
-        if (!(low.contains(".m3u8") || low.contains("mpegurl"))) {
+        if (!isHls(u) && !isDash(u)) {
             enqueue(u, h, r)
             return
         }
@@ -1534,7 +3065,7 @@ class MainActivity : Activity() {
         prober.execute {
             var vs: List<Variant> = emptyList()
             try {
-                vs = variants(u, h)
+                vs = if (isDash(u)) dashVariants(u, h) else variants(u, h)
             } catch (e: Exception) {
                 logErr("تحميل", "تعذر قراءة الجودات: " + (e.message ?: e.javaClass.simpleName), e)
             }
@@ -1552,19 +3083,23 @@ class MainActivity : Activity() {
         for (i in ls.indices) {
             val l = ls[i]
             if (!l.startsWith("#EXT-X-STREAM-INF")) continue
-            val bw = Regex("BANDWIDTH=(\\d+)").find(l)?.groupValues?.get(1)?.toLong() ?: 0L
+            val bw0 = Regex("(?<![A-Z-])BANDWIDTH=(\\d+)").find(l)?.groupValues?.get(1)?.toLong() ?: 0L
+            val avg = Regex("AVERAGE-BANDWIDTH=(\\d+)").find(l)?.groupValues?.get(1)?.toLong() ?: 0L
+            val bw = if (avg > 0) avg else bw0
             val res = Regex("RESOLUTION=\\d+x(\\d+)").find(l)?.groupValues?.get(1)
             val nx = ls.drop(i + 1).firstOrNull { it.isNotBlank() && !it.startsWith("#") } ?: continue
+            val resTxt = if (res != null) res + "p" else ""
             val label = (if (res != null) res + "p" else "جودة") + " • " + (bw / 1000) + " kbps"
-            out.add(Pair(bw, Variant(label, absUrl(u, nx.trim()))))
+            out.add(Pair(bw0, Variant(label, absUrl(u, nx.trim()), bw, resTxt)))
         }
         return out.sortedByDescending { it.first }.map { it.second }
     }
 
     private fun chooseQuality(vs: List<Variant>, u: String, h: Map<String, String>, r: Row) {
         val items = ArrayList<String>()
+        val dur = cands[u]?.meta?.dur ?: -1.0
         items.add("الأعلى جودة (تلقائي)")
-        for (v in vs) items.add(v.label)
+        for (v in vs) items.add(v.label + (if (dur > 0 && v.bw > 0) " • ≈ " + fmtSize(v.bw * dur / 8.0) else ""))
         AlertDialog.Builder(this)
             .setTitle("اختر الجودة")
             .setItems(items.toTypedArray()) { _, i -> enqueue(if (i == 0) u else vs[i - 1].url, h, r) }
@@ -1577,12 +3112,361 @@ class MainActivity : Activity() {
             .show()
     }
 
+    // يُحقن عند بداية كل مستند وفي كل الإطارات: يلتقط الفيديو من fetch/XHR/عناصر الوسائط، ويتعرف على m3u8/mpd من محتواها ولو كان نوعها عاماً
+    private fun hookJs(): String = HOOK_JS.replace("__READCAP__", prefs().getInt("readcap", 0).toString())
+        .replace("__STREAM__", if (prefs().getBoolean("scanstream", true)) "1" else "0")
+        .replace("__AUDIO__", if (capAudio()) "1" else "0")
+
+    private val HOOK_JS = """(function(){
+if(window.__tdlh){return;}
+window.__tdlh=1;
+var seen={};
+function has(){return typeof TDL!=='undefined';}
+function rpt(u){
+  try{
+    if(!u||!has()){return;}
+    u=String(u);
+    if(u.indexOf('http')!==0){try{u=new URL(u,location.href).href;}catch(e){return;}}
+    if(seen[u]){return;}
+    seen[u]=1;
+    TDL.found(u,location.href);
+  }catch(e){}
+}
+function vtype(ct){
+  return ct.indexOf('mpegurl')>=0||ct.indexOf('dash+xml')>=0||ct.indexOf('video/')>=0||(__AUDIO__===1&&ct.indexOf('audio/')>=0);
+}
+function sniff(u,t){
+  try{
+    if(!t){return;}
+    var s=t.slice(0,2000).replace(/^\uFEFF/,'').trim();
+    var k=s.indexOf('<MPD');
+    if(s.indexOf('#EXTM3U')===0||(k>=0&&k<400)){rpt(u);}
+  }catch(e){}
+}
+var VRE=/https?:(?:\\?\/){2}[^\s"'<>\\)\]}]+?\.(?:m3u8|mpd|mp4|m4v|mov|webm|mkv|flv|3gp|ogv|wmv|avi|mp3|aac|m4a|opus|flac)(?:\?[^\s"'<>\\)\]}]*)?/gi;
+function sc(txt){
+  try{
+    if(!txt){return;}
+    var m=txt.match(VRE),i,u;
+    if(m){for(i=0;i<m.length;i++){
+      u=m[i].replace(/\\u0026/g,'&').replace(/\\u002F/gi,'/').replace(/\\\//g,'/').replace(/&amp;/g,'&').replace(/\\/g,'');
+      rpt(u);
+    }}
+  }catch(e){}
+}
+try{
+  var ofe=window.fetch;
+  if(ofe){window.fetch=function(){
+    var a=arguments;
+    var p=ofe.apply(this,a);
+    try{
+      p.then(function(r){
+        try{
+          var ct=(r.headers.get('content-type')||'').toLowerCase();
+          var ru=r.url||(typeof a[0]==='string'?a[0]:((a[0]&&a[0].url)||''));
+          if(vtype(ct)){rpt(ru);return;}
+          if(/^(image|font|audio)\//.test(ct)||/css|html/.test(ct)){return;}
+          var len=parseInt(r.headers.get('content-length')||'0',10);
+          if(__STREAM__===0&&/event-stream/.test(ct)){return;}
+          var txt=/json|text|javascript|xml/.test(ct);
+          if(txt||!len||__READCAP__===0||len<__READCAP__*1024){
+            r.clone().text().then(function(t){sniff(ru,t);sc(t);}).catch(function(){});
+          }
+        }catch(e){}
+      }).catch(function(){});
+    }catch(e){}
+    return p;
+  };}
+}catch(e){}
+try{
+  var xo=XMLHttpRequest.prototype.open;
+  XMLHttpRequest.prototype.open=function(m,u){
+    var x=this;
+    this.addEventListener('readystatechange',function(){
+      try{
+        if(x.readyState===2){
+          var c2=(x.getResponseHeader('content-type')||'').toLowerCase();
+          if(vtype(c2)){rpt(x.responseURL||u);}
+        }
+        if(x.readyState===4&&(x.responseType===''||x.responseType==='text')){
+          var ct=(x.getResponseHeader('content-type')||'').toLowerCase();
+          if(vtype(ct)||/^(image|font|audio)\//.test(ct)||/css|html/.test(ct)){return;}
+          var t=x.responseText;
+          if(t){sniff(x.responseURL||u,t);sc(t);}
+        }
+      }catch(e){}
+    });
+    return xo.apply(this,arguments);
+  };
+}catch(e){}
+try{
+  var d=Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype,'src');
+  if(d&&d.set){
+    Object.defineProperty(HTMLMediaElement.prototype,'src',{configurable:true,enumerable:d.enumerable,get:d.get,set:function(v){
+      try{if(typeof v==='string'&&v.indexOf('http')===0){rpt(v);}}catch(e){}
+      return d.set.call(this,v);
+    }});
+  }
+}catch(e){}
+try{
+  var sa=Element.prototype.setAttribute;
+  Element.prototype.setAttribute=function(n,v){
+    try{
+      if(n==='src'&&typeof v==='string'&&v.indexOf('http')===0){
+        var tg=this.tagName;
+        if(tg==='VIDEO'||tg==='SOURCE'){rpt(v);}
+      }
+    }catch(e){}
+    return sa.apply(this,arguments);
+  };
+}catch(e){}
+try{
+  setInterval(function(){
+    var vs=document.querySelectorAll('video'),i;
+    for(i=0;i<vs.length;i++){
+      var v=vs[i];
+      try{
+        if(v.preload==='none'){v.preload='metadata';}
+        var cs=v.currentSrc||v.src;
+        if(cs&&cs.indexOf('http')===0){rpt(cs);}
+      }catch(e){}
+    }
+  },1500);
+}catch(e){}
+})();
+"""
+
+
+    private fun w2rescan() {
+        try { cur?.web?.evaluateJavascript(RESCAN_JS, null) } catch (e: Throwable) {}
+    }
+
+    // يمرر الصفحة تدريجياً حتى نهاية القائمة، ويستخرج كل روابط الفيديو من العناصر والسكربتات وطلبات الشبكة دفعة واحدة
+    private fun capturePage() {
+        val t = cur ?: return
+        if (t.scanning) {
+            t.scanning = false
+            t.web.evaluateJavascript("window.__tdlRid=(window.__tdlRid||0)+1;window.__tdlScan=0;", null)
+            capNote("فحص", t.lastUrl, "أوقفه المستخدم يدوياً")
+            w2rescan()
+            toast("تم إيقاف الفحص")
+            return
+        }
+        if (t.web.url.isNullOrEmpty() || t.start) { toast("افتح صفحة أولاً"); return }
+        t.scanning = true
+        capNote("فحص", t.lastUrl, "بدأ التمرير التلقائي والتقاط كل الفيديوهات")
+        toast("جارٍ التمرير والالتقاط. اضغط الزر مرة أخرى لإيقافه")
+        val js = CAPTURE_JS.replace("__MAXSTEPS__", prefs().getInt("scanmax", 0).toString())
+            .replace("__STILL__", prefs().getInt("scanstill", 6).toString())
+            .replace("__PLAY__", if (prefs().getBoolean("scanplay", false)) "1" else "0")
+            .replace("__PLAYMS__", "0")
+            .replace("__DELAY__", prefs().getInt("scandelay", 750).coerceAtLeast(50).toString())
+        t.web.evaluateJavascript(js, null)
+    }
+
+    private val CAPTURE_JS = """(function(){
+if(window.__tdlScan){return;}
+window.__tdlScan=1;
+var RID=window.__tdlRid=(window.__tdlRid||0)+1;
+var seen={},cnt=0,steps=0,i,j;
+var EXT=/\.(?:m3u8|mpd|mp4|m4v|mov|webm|mkv|flv|3gp|ogv|wmv|avi|mp3|aac|m4a|opus|flac)(?:[?#]|$)/i;
+var RE=/https?:(?:\\?\/){2}[^\s"'<>\\)\]}]+?\.(?:m3u8|mpd|mp4|m4v|mov|webm|mkv|flv|3gp|ogv|wmv|avi|mp3|aac|m4a|opus|flac)(?:\?[^\s"'<>\\)\]}]*)?/gi;
+function clean(u){return u.replace(/\\u0026/g,'&').replace(/\\u002F/gi,'/').replace(/\\\//g,'/').replace(/&amp;/g,'&').replace(/\\/g,'');}
+function rpt(u){
+  try{
+    if(!u){return;}
+    u=String(u);
+    if(u.indexOf('http')!==0){try{u=new URL(u,location.href).href;}catch(e){return;}}
+    if(seen[u]){return;}
+    seen[u]=1;cnt++;
+    TDL.found(u,location.href);
+  }catch(e){}
+}
+function scanText(t){
+  try{
+    if(!t){return;}
+    var m=t.match(RE),k;
+    if(m){for(k=0;k<m.length;k++){rpt(clean(m[k]));}}
+  }catch(e){}
+}
+function scanDoc(doc){
+  try{
+    var q=doc.querySelectorAll('video,source,a[href],[data-src],[data-video],[data-url],[data-hls],[data-mp4],[data-stream]');
+    var at=['src','href','data-src','data-video','data-url','data-hls','data-mp4','data-stream'];
+    for(i=0;i<q.length;i++){
+      var el=q[i];
+      if(el.tagName==='VIDEO'){
+        if(el.currentSrc&&el.currentSrc.indexOf('http')===0){rpt(el.currentSrc);}
+        try{if(!el.src&&!el.currentSrc){el.preload='metadata';el.load();}}catch(e){}
+        if(PLAY&&!el.__tdlp){
+          el.__tdlp=1;
+          (function(vd){try{var pr=vd.play();if(pr&&pr.then){pr.then(function(){if(PLAYMS>0){setTimeout(function(){try{vd.pause();}catch(e){}},PLAYMS);}}).catch(function(){});}}catch(e){}})(el);
+        }
+      }
+      for(j=0;j<at.length;j++){
+        var v=el.getAttribute(at[j]);
+        if(v&&EXT.test(v)){rpt(v);}
+      }
+    }
+    var ss=doc.querySelectorAll('script:not([src])');
+    for(i=0;i<ss.length;i++){
+      var tx=ss[i].textContent;
+      if(tx){scanText(tx);}
+    }
+  }catch(e){}
+}
+function scanDom(){
+  try{
+    scanDoc(document);
+    var fr=document.querySelectorAll('iframe');
+    for(var f=0;f<fr.length;f++){try{if(fr[f].contentDocument){scanDoc(fr[f].contentDocument);}}catch(e){}}
+    var es=performance.getEntriesByType('resource');
+    for(i=0;i<es.length;i++){
+      var n=es[i].name;
+      if(EXT.test(n)||/mpegurl|manifest/i.test(n)){rpt(n);}
+    }
+  }catch(e){}
+}
+function scrollers(){
+  var r=[],all=document.querySelectorAll('*'),k;
+  for(k=0;k<all.length;k++){
+    var e=all[k];
+    if(e.scrollHeight>e.clientHeight+80&&e.clientHeight>120){
+      var o=getComputedStyle(e).overflowY;
+      if(o==='auto'||o==='scroll'||o==='overlay'){r.push(e);}
+    }
+  }
+  r.sort(function(a,b){return b.scrollHeight-a.scrollHeight;});
+  return r;
+}
+var last=-1,still=0,MAXS=__MAXSTEPS__,STILL=__STILL__,PLAY=__PLAY__,PLAYMS=__PLAYMS__,DELAY=__DELAY__;
+var sc=scrollers();
+function finish(){
+  if(window.__tdlRid!==RID){return;}
+  try{scanDom();}catch(e){}
+  try{window.scrollTo(0,0);}catch(e){}
+  try{TDL.scanDone(cnt,steps);}catch(e){}
+  window.__tdlScan=0;
+}
+function tick(){
+  if(window.__tdlRid!==RID){return;}
+  try{
+    steps++;
+    scanDom();
+    var de=document.scrollingElement||document.documentElement;
+    var h=de.scrollHeight,tot=h,k;
+    window.scrollBy(0,Math.max(300,window.innerHeight*0.85));
+    for(k=0;k<sc.length;k++){tot+=sc[k].scrollHeight;sc[k].scrollTop+=Math.max(300,sc[k].clientHeight*0.85);}
+    var atBottom=(window.innerHeight+window.pageYOffset>=de.scrollHeight-4);
+    for(k=0;k<sc.length;k++){if(sc[k].scrollTop+sc[k].clientHeight<sc[k].scrollHeight-4){atBottom=false;}}
+    tot+=cnt*1000+performance.getEntriesByType('resource').length;
+    if(tot===last&&atBottom){still++;}else{still=0;}
+    last=tot;
+    if(still>=STILL||(MAXS>0&&steps>=MAXS)){setTimeout(finish,DELAY*2);return;}
+    setTimeout(tick,DELAY);
+  }catch(e){finish();}
+}
+tick();
+})();
+"""
+
+    // إعادة مسح سريعة لما حمّلته الصفحة (تُستعمل عند الضغط على فيديو blob ولا يوجد رابط ملتقط)
+    private val RESCAN_JS = """(function(){
+try{
+  if(typeof TDL==='undefined'){return;}
+  var es=performance.getEntriesByType('resource');
+  for(var i=0;i<es.length;i++){
+    var n=es[i].name;
+    if(/\.(?:m3u8|mpd|mp4|webm|m4v|mov|mkv|flv)(?:[?#]|\b)/i.test(n)||/mpegurl|manifest/i.test(n)){TDL.found(n,location.href);}
+  }
+}catch(e){}
+})();
+"""
+
+    private fun overlayJs(): String = OVERLAY_JS.replace("__MAXN__", prefs().getInt("maxoverlay", 0).toString())
+
     private val OVERLAY_JS = """(function(){
 if(window.__tdl){return;}
 window.__tdl=1;
 var map=new Map();
-var MAXN=60;
+var MAXN=__MAXN__;
 function has(){return typeof TDL!=='undefined';}
+var rpt={};
+function rep(u,ct){
+  try{
+    if(!has()||!u){return;}
+    ct=(ct||'').toLowerCase();
+    if(ct.indexOf('mpegurl')>=0||ct.indexOf('dash+xml')>=0||ct.indexOf('video/')>=0){
+      u=String(u);
+      if(!rpt[u]){rpt[u]=1;TDL.found(u,location.href);}
+    }
+  }catch(e){}
+}
+try{
+  var ofe=window.__tdlh?null:window.fetch;
+  if(ofe){window.fetch=function(){
+    var a=arguments;
+    return ofe.apply(this,a).then(function(r){
+      try{
+        var ct=r.headers.get('content-type')||'';
+        rep(r.url||a[0],ct);
+        if(/json|text|javascript/i.test(ct)){
+          r.clone().text().then(function(t){if(t){sc(t);}}).catch(function(){});
+        }
+      }catch(e){}
+      return r;
+    });
+  };}
+  var xo=XMLHttpRequest.prototype.open;
+  if(!window.__tdlh)XMLHttpRequest.prototype.open=function(m,u){
+    var x=this;
+    this.addEventListener('readystatechange',function(){
+      if(x.readyState===2){try{rep(x.responseURL||u,x.getResponseHeader('content-type'));}catch(e){}}
+      if(x.readyState===4){
+        try{
+          var ct=x.getResponseHeader('content-type')||'';
+          if((x.responseType===''||x.responseType==='text')&&/json|text|javascript/i.test(ct)){
+            var t=x.responseText;if(t){sc(t);}
+          }
+        }catch(e){}
+      }
+    });
+    return xo.apply(this,arguments);
+  };
+}catch(e){}
+var VRE=/https?:(?:\\?\/){2}[^\s"'<>\\)\]}]+?\.(?:m3u8|mpd|mp4|m4v|mov|webm|mkv|flv|3gp)(?:\?[^\s"'<>\\)\]}]*)?/gi;
+var RRE=/["'](\/[^"'\s<>\\]+?\.(?:m3u8|mpd|mp4|m4v|mov|webm)(?:\?[^"'\s<>\\]*)?)["']/gi;
+function sc(txt){
+  try{
+    if(!txt||!has()){return;}
+    var m=txt.match(VRE),i,u;
+    if(m){for(i=0;i<m.length;i++){
+      u=m[i].replace(/\\u0026/g,'&').replace(/\\u002F/gi,'/').replace(/\\\//g,'/').replace(/&amp;/g,'&').replace(/\\/g,'');
+      if(!rpt[u]){rpt[u]=1;TDL.found(u,location.href);}
+    }}
+    var r2=txt.match(RRE);
+    if(r2){for(i=0;i<r2.length&&i<200;i++){
+      try{u=new URL(r2[i].slice(1,-1),location.href).href;}catch(e){continue;}
+      if(!rpt[u]){rpt[u]=1;TDL.found(u,location.href);}
+    }}
+  }catch(e){}
+}
+var lastLen=-1;
+function deep(){
+  try{
+    var es=performance.getEntriesByType('resource');
+    for(var i=0;i<es.length;i++){
+      var n=es[i].name,p=n.split('?')[0].toLowerCase();
+      if(!rpt[n]&&(es[i].initiatorType==='video'||/\.(m3u8|mpd|mp4|m4v|mov|webm|mkv|flv|3gp)$/.test(p))){
+        rpt[n]=1;if(has()){TDL.found(n,location.href);}
+      }
+    }
+  }catch(e){}
+  try{
+    var html=document.documentElement.innerHTML;
+    if(html.length!==lastLen){lastLen=html.length;sc(html);}
+  }catch(e){}
+}
 function mk(txt,fn){
   var b=document.createElement('div');
   b.textContent=txt;
@@ -1594,9 +3478,6 @@ function srcOf(v){
   var s=v.currentSrc||v.src||'';
   if(!s){var so=v.querySelector('source');if(so){s=so.src||'';}}
   return s;
-}
-function imgSrc(el){
-  return el.currentSrc||el.src||el.getAttribute('data-src')||el.getAttribute('data-original')||'';
 }
 function fmt(t){
   if(!isFinite(t)){return '0:00';}
@@ -1614,13 +3495,11 @@ function setup(el){
   row.setAttribute('style','display:flex;pointer-events:auto;');
   var dl=mk('\u2B07',function(){
     if(!has()){return;}
-    if(isV){TDL.video(srcOf(el),location.href);}
-    else{TDL.image(imgSrc(el),location.href,'dl');}
+    TDL.video(srcOf(el),location.href);
   });
   var cp=mk('\uD83D\uDD17',function(){
     if(!has()){return;}
-    if(isV){TDL.copyVideo(srcOf(el));}
-    else{TDL.image(imgSrc(el),location.href,'copy');}
+    TDL.copyVideo(srcOf(el));
   });
   row.appendChild(dl);
   row.appendChild(cp);
@@ -1676,8 +3555,6 @@ function setup(el){
         TDL.err('توقف الفيديو (رمز '+c+'): '+srcOf(el).slice(0,150));
       }
     });
-  }else{
-    box.appendChild(row);
   }
   document.body.appendChild(box);
   st.box=box;
@@ -1713,13 +3590,15 @@ function upd(){
   });
 }
 function scan(){
-  var list=document.querySelectorAll('video,img');
+  var list=document.querySelectorAll('video');
+  for(var j=0;j<list.length;j++){
+    var cs0=list[j].currentSrc||list[j].src||'';
+    if(cs0.indexOf('http')===0&&!rpt[cs0]&&has()){rpt[cs0]=1;try{TDL.found(cs0,location.href);}catch(e){}}
+  }
   for(var i=0;i<list.length;i++){
     var el=list[i];
-    if(!map.has(el)&&map.size<MAXN){
-      var r=el.getBoundingClientRect();
+    if(!map.has(el)&&(MAXN<=0||map.size<MAXN)){
       if(el.tagName==='VIDEO'){setup(el);}
-      else if(r.width>=100&&r.height>=100){setup(el);}
     }
   }
   map.forEach(function(st,el){
@@ -1744,9 +3623,11 @@ function sched(){
 window.addEventListener('scroll',sched,{capture:true,passive:true});
 window.addEventListener('touchmove',sched,{capture:true,passive:true});
 window.addEventListener('resize',sched,false);
-setInterval(upd,300);
-setInterval(scan,1500);
+setInterval(function(){if(!document.hidden){upd();}},400);
+setInterval(function(){if(!document.hidden){scan();}},1200);
+setInterval(function(){if(!document.hidden){deep();}},2500);
 scan();
+deep();
 })();
 """
 
@@ -1756,7 +3637,12 @@ scan();
         val n = found.size
         badge.visibility = if (n > 0 && page == 0) View.VISIBLE else View.GONE
         badge.text = "تحميل ($n)"
+        val bc = candsOf(cur).size
+        dlFab.visibility = if (bc > 0 && page == 0) View.VISIBLE else View.GONE
+        dlFab.text = if (bc > 1) "⬇ تحميل الفيديو ($bc)" else "⬇ تحميل الفيديو"
         val act = activeBox.childCount
+        activeTitle.text = if (act > 0) "جارٍ التحميل الآن ($act)" else "جارٍ التحميل الآن"
+        activeEmpty.visibility = if (act > 0) View.GONE else View.VISIBLE
         navItems[1].second.text = if (act > 0) "جارٍ ($act)" else if (n > 0) "التحميلات ($n)" else "التحميلات"
         emptyTv.visibility = if (n > 0) View.GONE else View.VISIBLE
         if (navItems.size > 4) navItems[4].second.text = if (alerts.isNotEmpty()) "التنبيهات (" + alerts.size + ")" else "التنبيهات"
@@ -1766,9 +3652,492 @@ scan();
     private fun clearFound() {
         list.removeAllViews()
         found.clear()
+        cands.clear()
+        considered.clear()
+        subUrls.clear()
         foundStart.clear()
         foundHdr.clear()
         updateCounts()
+    }
+
+    private fun isHls(u: String): Boolean {
+        val l = u.lowercase()
+        return l.contains(".m3u8") || l.contains("mpegurl") || hlsSet.contains(u)
+    }
+
+    private fun fmtDur(sec: Double): String = fmtTime(sec.toLong())
+
+    private fun dropCand(c: Cand) {
+        list.removeView(c.view)
+        found.remove(c.url)
+        foundStart.remove(c.url)
+        foundHdr.remove(c.url)
+        cands.remove(c.url)
+    }
+
+    private fun tabKey(t: Tab?): String = System.identityHashCode(t).toString() + "|"
+
+    // فيديوهات التبويب الحالي المسجلة (غير البث المباشر)
+    private fun candsOf(t: Tab?): List<Cand> =
+        if (t == null) emptyList() else cands.values.filter { it.owner === t && it.meta?.vod != false }
+
+    // أفضل مرشح للتبويب: قوائم البث (m3u8/mpd) أولاً ثم الأطول مدة والأكبر حجماً، وعند التساوي الأحدث
+    private fun bestFor(t: Tab?): Cand? {
+        val l = candsOf(t)
+        var best: Cand? = null
+        var bs = -1.0
+        for (c in l) {
+            val m = c.meta
+            var sc = 0.0
+            if (isHls(c.url) || isDash(c.url)) sc += 1e12
+            if (m != null) {
+                if (m.dur > 0) sc += m.dur * 1000.0
+                if (m.size > 0) sc += m.size / 1024.0
+            }
+            if (sc >= bs) {
+                bs = sc
+                best = c
+            }
+        }
+        return best
+    }
+
+    // الانتقال لصفحة أخرى: نمسح روابط هذا التبويب التي لم يبدأ تحميلها حتى لا تختلط فيديوهات الصفحات
+    private fun pruneTab(t: Tab) {
+        val k = tabKey(t)
+        considered.removeAll { it.startsWith(k) }
+        for (c in ArrayList(cands.values)) {
+            if (c.owner === t && c.rw.btn.isEnabled && c.rw.bar.visibility != View.VISIBLE) dropCand(c)
+        }
+        updateCounts()
+    }
+
+    private fun startCand(c: Cand) {
+        val go = foundStart[c.url]
+        if (go == null) {
+            toast("تعذر بدء التحميل")
+            return
+        }
+        go()
+        toast("تابع التحميل من تبويب التحميلات")
+    }
+
+    private fun onFabClick() {
+        val cs = candsOf(cur)
+        if (cs.isEmpty()) {
+            updateCounts()
+            toast("شغّل الفيديو لحظة ثم اضغط مرة أخرى")
+            return
+        }
+        if (cs.size == 1) {
+            startCand(cs[0])
+            return
+        }
+        val ordered = cs.reversed()
+        AlertDialog.Builder(this)
+            .setTitle("اختر الفيديو")
+            .setItems(ordered.map { it.title }.toTypedArray()) { _, i -> startCand(ordered[i]) }
+            .show()
+    }
+
+    private fun refreshInfo(c: Cand) {
+        val m = c.meta
+        val tags = ArrayList<String>()
+        if (m != null) {
+            tags.add((if (m.vod) "مسجل" else "بث مباشر") + (if (m.why.startsWith("يدوي")) " (يدوي)" else if (m.conf in 1..99) " (تقديري " + m.conf + "%)" else ""))
+            if (m.dur > 0) tags.add(fmtDur(m.dur))
+            if (m.res.isNotBlank()) tags.add("الجودة " + m.res)
+            if (m.kbps > 0) tags.add(m.kbps.toString() + " kbps")
+            if (m.size > 0) tags.add("الحجم " + (if (m.sizeEst) "≈ " else "") + fmtSize(m.size.toDouble()))
+        }
+        c.info.text = c.hostTxt + (if (tags.isNotEmpty()) "\n" + tags.joinToString(" • ") else "")
+        c.title = c.pageTitle + (if (tags.isNotEmpty()) " — " + tags.joinToString(" • ") else "")
+    }
+
+    // جودة وأبعاد الملف المباشر (mp4/webm...) من بيانات الملف نفسه، بعد ظهوره في القائمة
+    private fun enrich(c: Cand, h: Map<String, String>) {
+        try {
+            analyzer.execute {
+                try {
+                    val r = MediaMetadataRetriever()
+                    try {
+                        val hh = HashMap<String, String>()
+                        for ((k, v) in h) if (v.isNotEmpty()) hh[k] = v
+                        r.setDataSource(c.url, hh)
+                        val ht = r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT)?.toIntOrNull() ?: 0
+                        val wd = r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH)?.toIntOrNull() ?: 0
+                        val br = r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_BITRATE)?.toLongOrNull() ?: 0L
+                        val du = r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLongOrNull() ?: 0L
+                        val side = if (ht > 0) minOf(ht, if (wd > 0) wd else ht).takeIf { wd in 1 until ht } ?: ht else 0
+                        ui.post {
+                            val m = c.meta
+                            if (m != null && cands[c.url] === c) {
+                                c.meta = m.copy(
+                                    res = if (side > 0) side.toString() + "p" else m.res,
+                                    kbps = if (br > 0) br / 1000 else m.kbps,
+                                    dur = if (du > 0) du / 1000.0 else m.dur
+                                )
+                                refreshInfo(c)
+                            }
+                        }
+                    } finally {
+                        try { r.release() } catch (e: Throwable) {}
+                    }
+                } catch (e: Throwable) {
+                }
+            }
+        } catch (e: Throwable) {
+        }
+    }
+
+    // مشاهدة الفيديو: النهائي إن اكتمل، وإلا الجزء المحمّل حتى الآن
+    private fun watchRow(r: Row) {
+        val fl = r.finalLoc
+        if (fl != null) {
+            playVideo(fl, r.finalIsUri)
+            return
+        }
+        val w = r.work
+        if (w == null || !w.exists()) {
+            toast("لم يُحمَّل أي جزء بعد")
+            return
+        }
+        toast("جاري تجهيز الجزء المحمّل للمشاهدة...")
+        try {
+            previewPool.execute {
+                var f: File? = null
+                try {
+                    f = buildPreview(w)
+                } catch (e: Throwable) {
+                    logErr("مشاهدة", "تعذر تجهيز المعاينة: " + (e.message ?: e.javaClass.simpleName), e)
+                }
+                val pf = f
+                ui.post {
+                    if (pf == null) toast("لم يُحمَّل جزء كافٍ للمشاهدة بعد، انتظر قليلاً")
+                    else playVideo(pf.absolutePath, false)
+                }
+            }
+        } catch (e: Throwable) {
+        }
+    }
+
+    // يجمع الأجزاء المتتالية من البداية (بدون ثغرات) في ملف قابل للتشغيل
+    private fun buildPreview(work: File): File? {
+        val pdir0 = File(work, "preview")
+        // DASH: مسار الصورة فقط (بدون صوت) من الأجزاء المتتالية
+        if (File(work, "dv_00000.seg").exists()) {
+            val dp = ArrayList<File>()
+            var k = 0
+            while (true) {
+                val f = File(work, "dv_%05d.seg".format(k))
+                if (f.exists() && f.length() > 0) { dp.add(f); k++ } else break
+            }
+            if (dp.isEmpty()) return null
+            val di = File(work, "dv_init.mp4").takeIf { it.exists() && it.length() > 0 }
+            pdir0.deleteRecursively()
+            pdir0.mkdirs()
+            val dout = File(pdir0, "preview.mp4")
+            dout.outputStream().buffered().use { o ->
+                if (di != null) di.inputStream().use { it.copyTo(o) }
+                for (p in dp) p.inputStream().use { it.copyTo(o) }
+            }
+            return dout
+        }
+        if (File(work, "dv").isDirectory) {
+            pdir0.deleteRecursively()
+            return previewDirect(File(work, "dv"), pdir0)
+        }
+        val first = File(work, "part_00000.seg")
+        if (!first.exists()) {
+            // تحميل مباشر: يعمل حتى لو كان moov في آخر الملف
+            pdir0.deleteRecursively()
+            return previewDirect(work, pdir0)
+        }
+        val parts = ArrayList<File>()
+        var i = 0
+        while (true) {
+            val f = File(work, "part_%05d.seg".format(i))
+            if (f.exists() && f.length() > 0) { parts.add(f); i++ } else break
+        }
+        if (parts.isEmpty()) return null
+        val ini = File(work, "init.mp4").takeIf { it.exists() && it.length() > 0 }
+        val fam = File(work, "fam_mp4").exists()
+        val pdir = File(work, "preview")
+        pdir.deleteRecursively()
+        pdir.mkdirs()
+        if (fam && ini == null) {
+            // أجزاء mp4 مستقلة: ندمجها فعلياً
+            return merge(HlsJob(parts, null, true), pdir, "preview")
+        }
+        val out = File(pdir, if (fam) "preview.mp4" else "preview.ts")
+        out.outputStream().buffered().use { o ->
+            if (ini != null) ini.inputStream().use { it.copyTo(o) }
+            for (p in parts) p.inputStream().use { it.copyTo(o) }
+        }
+        return out
+    }
+
+    private fun playVideo(src: String, isUri: Boolean) {
+        val dlg = android.app.Dialog(this, android.R.style.Theme_Black_NoTitleBar_Fullscreen)
+        val fl = FrameLayout(this)
+        fl.setBackgroundColor(Color.BLACK)
+        val vv = android.widget.VideoView(this)
+        val mc = android.widget.MediaController(this)
+        mc.setAnchorView(vv)
+        vv.setMediaController(mc)
+        fl.addView(vv, FrameLayout.LayoutParams(MATCH, MATCH, Gravity.CENTER))
+        val close = pill("✕ إغلاق", false) { dlg.dismiss() }
+        val cp = FrameLayout.LayoutParams(WRAP, WRAP, Gravity.TOP or Gravity.START)
+        cp.setMargins(dp(12), dp(24), 0, 0)
+        fl.addView(close, cp)
+        vv.setOnErrorListener { _, _, _ ->
+            toast("تعذر تشغيل هذا الجزء، قد يحتاج تحميلاً أكثر")
+            true
+        }
+        vv.setOnPreparedListener { it.start() }
+        try {
+            if (isUri) vv.setVideoURI(Uri.parse(src)) else vv.setVideoPath(src)
+        } catch (e: Throwable) {
+            toast("تعذر فتح الفيديو")
+            return
+        }
+        dlg.setContentView(fl)
+        dlg.setOnDismissListener { try { vv.stopPlayback() } catch (e: Throwable) {} }
+        dlg.show()
+    }
+
+    // يقرر هل الرابط فيديو حقيقي: يقرأ قائمة m3u8 (مسجل أم مباشر + المدة + الجودة + الحجم التقديري)، ويتحقق من نوع الملفات المباشرة
+    private fun consider(u: String, h: Map<String, String>, v: WebView?) {
+        val t = if (v != null) hasTab(v) else cur
+        val key = tabKey(t) + u
+        if (!showKnownSeg() && segUrls.contains(u)) { capNote("أُهمل", u, "جزء من قائمة بث معروفة (يمكنك إظهاره من الإعدادات: إظهار أجزاء القوائم)"); return }
+        if (!considered.add(key)) return
+        try {
+            analyzer.execute {
+                var meta: Meta? = null
+                var ok = true
+                try {
+                    meta = analyze(u, h, getOvr(u))
+                    if (meta == null) { ok = false; capNote("أُهمل", u, "ليس فيديو: نوع المحتوى ليس فيديو، أو القائمة فارغة أو غير صالحة") }
+                } catch (e: Throwable) {
+                    meta = null // تعذر الفحص: نعرض الرابط كما هو بدل أن نخسره
+                    capNote("تنبيه", u, "تعذر فحص الرابط (" + (e.message ?: e.javaClass.simpleName) + ") فعُرض كما هو")
+                    logErr("التقاط", "تعذر فحص الرابط: " + (e.message ?: e.javaClass.simpleName), e)
+                }
+                val m: Meta? = meta
+                val thr = prefs().getInt("uncert", 75)
+                val unsure = m != null && thr > 0 && m.conf < thr && !m.why.startsWith("يدوي")
+                if (ok && m != null && !m.vod && !prefs().getBoolean("showlive", true) && !unsure) {
+                    ok = false
+                    excluded[u] = Excl(u, h, m, t, t?.title ?: "")
+                    capNote("أُهمل", u, "بث مباشر (" + m.why + "، ثقة " + m.conf + "%). يمكنك إضافته من «الروابط المستبعدة»")
+                }
+                if (ok && !showKnownSeg() && segUrls.contains(u)) { ok = false; capNote("أُهمل", u, "جزء من بث (segment)") }
+                if (ok) capNote("قُبل", u, if (m == null) "قُبل بلا معلومات" else (if (m.vod) "فيديو مسجل" else "بث مباشر") + " (" + m.why + "، ثقة " + m.conf + "%)" + (if (m.dur > 0) " • " + fmtDur(m.dur) else "") + (if (m.res.isNotEmpty()) " • " + m.res else ""))
+                if (ok) ui.post {
+                    if (t == null || tabs.contains(t)) {
+                        addFound(u, h, m, t, t?.title ?: "")
+                        val c = cands[u]
+                        if (c != null && c.meta != null && !isHls(u) && !isDash(u)) enrich(c, h)
+                    }
+                    // أي جزء بث (segment) ظهر قبل معرفة قائمته يُحذف
+                    for (c in ArrayList(cands.values)) {
+                        if (!showKnownSeg() && segUrls.contains(c.url) && c.rw.btn.isEnabled && c.rw.bar.visibility != View.VISIBLE) dropCand(c)
+                    }
+                    updateCounts()
+                }
+            }
+        } catch (e: Throwable) {
+        }
+    }
+
+    private fun analyze(u: String, h: Map<String, String>, force: Boolean? = null): Meta? {
+        var hls = isHls(u)
+        var dashMode = isDash(u)
+        var size = -1L
+        var ct = ""
+        if (!hls && !dashMode) {
+            // نقرأ أول بايت فقط: نوع المحتوى والحجم الكلي
+            val c = try { conn(u, h, "bytes=0-0") } catch (e: Exception) { conn(u, h) } // بعض الخوادم ترفض Range: نقرأ الرؤوس بطلب عادي
+            try {
+                ct = (c.contentType ?: "").lowercase()
+                size = if (c.responseCode == 206) {
+                    (c.getHeaderField("Content-Range") ?: "").substringAfterLast('/', "").trim().toLongOrNull() ?: -1L
+                } else c.contentLengthLong
+            } finally {
+                try { c.disconnect() } catch (e: Throwable) {}
+            }
+            if (ct.contains("dash+xml")) dashMode = true
+            else if (ct.contains("mpegurl")) hls = true
+            else if (ct.startsWith("text/") || ct.contains("json") || ct.contains("html") || ct.contains("javascript") ||
+                ct.startsWith("image/") || (ct.startsWith("audio/") && !capAudio()) || ct.contains("xml") || ct.contains("css")) return null
+        }
+        if (dashMode) {
+            val base = u.substringBefore("#tdlrep=")
+            val xml = text(base, h)
+            if (!xml.contains("<MPD")) return null
+            dashSet.add(base)
+            val info = parseMpd(base, xml)
+            if (info.video.isEmpty() && info.audio.isEmpty()) return null
+            for (r in info.video + info.audio) {
+                r.init?.let { segUrls.add(it) }
+                for (x in r.segs) segUrls.add(x)
+                r.single?.let { segUrls.add(it) }
+            }
+            val bv = info.video.maxByOrNull { it.bw }
+            val bwTot = (bv?.bw ?: 0L) + (info.audio.maxByOrNull { it.bw }?.bw ?: 0L)
+            val total = if (bwTot > 0 && info.dur > 0) (bwTot * info.dur / 8.0).toLong() else -1L
+            var isLive = info.live
+            var conf = 100
+            var why = ""
+            if (force != null) {
+                isLive = !force
+                why = "يدوي"
+            } else if (isLive) {
+                // type=dynamic لا يعني بثاً دائماً: نقارن المانيفست بعد انتظار مرتين
+                val hasMup = xml.contains("minimumUpdatePeriod")
+                var changed = false
+                var ended = false
+                var failed = false
+                try {
+                    val w = prefs().getInt("livewait", 0).let { if (it > 0) it * 1000L else 5000L }
+                    val norm = { x: String -> x.replace(Regex("\\s+"), "") }
+                    val first = norm(xml)
+                    for (round in 0 until 2) {
+                        Thread.sleep(w)
+                        val xml2 = text(base, h)
+                        if (xml2.contains("type=\"static\"")) { ended = true; break }
+                        if (norm(xml2) != first) { changed = true; break }
+                    }
+                } catch (e: InterruptedException) {
+                    throw e
+                } catch (e: Throwable) {
+                    failed = true
+                }
+                if (ended) { isLive = false; conf = 100; why = "المانيفست صار static" }
+                else if (changed) { isLive = true; conf = 95; why = "المانيفست يتجدد" }
+                else if (failed) { isLive = true; conf = 30; why = "تعذر إعادة فحص المانيفست" }
+                else { isLive = false; conf = if (hasMup) 60 else 80; why = "المانيفست ثابت" }
+                capNote("تحليل", u, "DASH: " + why + " (" + conf + "%)")
+            }
+            return Meta(!isLive, if (info.dur > 0) info.dur else -1.0, total, true,
+                if (bv != null && bv.h > 0) bv.h.toString() + "p" else "", bwTot / 1000, emptyList(), conf, why)
+        }
+        if (hls) {
+            var pl = text(u, h)
+            if (!pl.trimStart().startsWith("#EXTM3U")) return null
+            hlsSet.add(u)
+            var base = u
+            var res = ""
+            var kbps = 0L
+            var bw = 0L
+            val subs = ArrayList<String>()
+            if (pl.contains("#EXT-X-STREAM-INF")) {
+                val vs = variants(u, h)
+                if (vs.isEmpty()) return Meta(true, -1.0, -1L, false, "", 0L, subs)
+                for (x in vs) { subs.add(x.url); hlsSet.add(x.url) }
+                res = vs[0].res
+                bw = vs[0].bw
+                kbps = bw / 1000
+                base = vs[0].url
+                pl = text(base, h)
+            }
+            var vod = pl.contains("#EXT-X-ENDLIST") || pl.contains("#EXT-X-PLAYLIST-TYPE:VOD")
+            var dur = 0.0
+            var count = 0
+            var firstSeg: String? = null
+            for (raw in pl.lineSequence()) {
+                val l = raw.trim()
+                if (l.startsWith("#EXTINF:")) dur += l.substring(8).substringBefore(',').trim().toDoubleOrNull() ?: 0.0
+                else if (l.startsWith("#EXT-X-MAP")) {
+                    Regex("URI=\"([^\"]+)\"").find(l)?.groupValues?.get(1)?.let { segUrls.add(absUrl(base, it)) }
+                } else if (l.isNotEmpty() && !l.startsWith("#")) {
+                    val su = absUrl(base, l)
+                    segUrls.add(su)
+                    if (firstSeg == null) firstSeg = su
+                    count++
+                }
+            }
+            // الحكم: علامة النهاية قاطعة. وإلا نقارن القائمة مرتين بعد انتظار أطول من target-duration:
+            // تجدد = بث مباشر، ثبات = مسجل مع درجة ثقة تُخفض عند القرائن المشبوهة (تسلسل لا يبدأ من 0، نوع EVENT، مدة قصيرة)
+            var conf = 100
+            var why = ""
+            if (force != null) {
+                vod = force
+                why = "يدوي"
+            } else if (vod) {
+                why = "علامة النهاية موجودة"
+            } else if (count > 0) {
+                val td = Regex("#EXT-X-TARGETDURATION:(\\d+)").find(pl)?.groupValues?.get(1)?.toLongOrNull() ?: 4L
+                val lw = prefs().getInt("livewait", 0)
+                val waitMs = if (lw > 0) lw * 1000L else (td * 1500L).coerceAtLeast(3500L)
+                fun sig(x: String): String {
+                    val sq = Regex("#EXT-X-MEDIA-SEQUENCE:(\\d+)").find(x)?.groupValues?.get(1) ?: ""
+                    val ls = x.lineSequence().map { it.trim() }.lastOrNull { it.isNotEmpty() && !it.startsWith("#") } ?: ""
+                    val n = x.lineSequence().count { it.isNotBlank() && !it.trim().startsWith("#") }
+                    return sq + "|" + ls + "|" + n
+                }
+                var lastSig = sig(pl)
+                var changed = false
+                var ended = false
+                var failed = false
+                try {
+                    for (round in 0 until 2) {
+                        Thread.sleep(waitMs)
+                        val p2 = text(base, h)
+                        if (p2.contains("#EXT-X-ENDLIST")) { ended = true; break }
+                        val s2 = sig(p2)
+                        if (s2 != lastSig) { changed = true; break }
+                        lastSig = s2
+                    }
+                } catch (e: InterruptedException) {
+                    throw e
+                } catch (e: Throwable) {
+                    failed = true
+                }
+                if (ended) { vod = true; conf = 100; why = "ظهرت علامة نهاية" }
+                else if (changed) { vod = false; conf = 95; why = "القائمة تتجدد" }
+                else if (failed) { vod = false; conf = 30; why = "تعذر إعادة فحص القائمة" }
+                else {
+                    vod = true
+                    conf = 85
+                    why = "القائمة ثابتة بلا علامة نهاية"
+                    val seq0 = (Regex("#EXT-X-MEDIA-SEQUENCE:(\\d+)").find(pl)?.groupValues?.get(1)?.toLongOrNull() ?: 0L) == 0L
+                    if (!seq0) conf -= 20
+                    if (pl.contains("#EXT-X-PLAYLIST-TYPE:EVENT")) conf -= 15
+                    if (dur < 30.0) conf -= 10
+                }
+                capNote("تحليل", u, "HLS: " + (if (vod) "مسجل" else "بث") + " - " + why + " (" + conf + "%)")
+            } else {
+                vod = false
+                conf = 40
+                why = "قائمة بلا أجزاء"
+            }
+            // الحجم: من معدل البت إن عُرف، وإلا من حجم أول جزء × عدد الأجزاء
+            var total = -1L
+            var est = true
+            if (bw > 0 && dur > 0) total = (bw * dur / 8.0).toLong()
+            else if (firstSeg != null && count > 0) {
+                try {
+                    val c = conn(firstSeg, h, "bytes=0-0")
+                    try {
+                        val one = if (c.responseCode == 206) {
+                            (c.getHeaderField("Content-Range") ?: "").substringAfterLast('/', "").trim().toLongOrNull() ?: -1L
+                        } else c.contentLengthLong
+                        if (one > 0) total = one * count
+                        if (one > 0 && dur > 0) kbps = (one * count * 8.0 / dur / 1000.0).toLong()
+                    } finally {
+                        try { c.disconnect() } catch (e: Throwable) {}
+                    }
+                } catch (e: Throwable) {
+                }
+            }
+            return Meta(vod, if (dur > 0) dur else -1.0, total, est, res, kbps, subs, conf, why)
+        }
+        // ملف فيديو مباشر (mp4 / webm / mov / mkv ...): الحجم الفعلي من الخادم
+        return Meta(force != false, -1.0, size, false, "", 0L, emptyList(),
+            if (force != null) 100 else if (size <= 0) 70 else 100,
+            if (force != null) "يدوي" else if (size <= 0) "حجم غير معروف: قد يكون بثاً" else "")
     }
 
     private fun addManual() {
@@ -1781,13 +4150,21 @@ scan();
         h["User-Agent"] = curUa
         h["Referer"] = cur?.web?.url ?: ""
         h["Cookie"] = CookieManager.getInstance().getCookie(u) ?: ""
-        addFound(u, h)
+        addFound(u, h, null, cur, "")
         manualBox.setText("")
         showPage(1)
     }
 
-    private fun addFound(u: String, h: Map<String, String>) {
-        if (found.contains(u)) return
+    private fun addFound(u: String, h: Map<String, String>, meta: Meta? = null, owner: Tab? = null, pageTitle: String = "") {
+        if (found.contains(u) || subUrls.contains(u) || (!showKnownSeg() && segUrls.contains(u))) return
+        // ملف رئيسي (master): نحذف أي جودة فرعية ظهرت قبله لنفس الفيديو ولم يبدأ تحميلها
+        if (meta != null && meta.subs.isNotEmpty()) {
+            subUrls.addAll(meta.subs)
+            for (su in meta.subs) {
+                val c = cands[su] ?: continue
+                if (c.rw.btn.isEnabled && c.rw.bar.visibility != View.VISIBLE) dropCand(c)
+            }
+        }
         found.add(u)
 
         val row = LinearLayout(this)
@@ -1796,13 +4173,18 @@ scan();
         row.setPadding(dp(12), dp(12), dp(12), dp(12))
 
         val name = u.substringAfterLast('/').substringBefore('?').take(60)
-        val title = tv(if (name.isBlank()) "فيديو" else name, 14f, cText, true)
-        val host = tv(Uri.parse(u).host ?: "", 12f, cMuted)
+        val shownName = if (pageTitle.isNotBlank()) pageTitle.take(70) else if (name.isBlank()) "فيديو" else name
+        val title = tv(shownName, 14f, cText, true)
+        val host = tv("", 12f, cMuted)
         val msg = tv("", 12f, cMuted)
-        val bar = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal)
+        // شريط تقدم بشكل سلايدر (للعرض فقط، لا يُسحب باللمس)
+        val bar = android.widget.SeekBar(this)
         bar.max = 100
         bar.progressTintList = ColorStateList.valueOf(cAccent)
         bar.progressBackgroundTintList = ColorStateList.valueOf(cLine)
+        bar.thumbTintList = ColorStateList.valueOf(cAccent)
+        bar.setPadding(dp(10), 0, dp(10), 0)
+        bar.setOnTouchListener { _, _ -> true }
         bar.visibility = View.GONE
 
         val btn = pill("تحميل", true) { }
@@ -1828,18 +4210,30 @@ scan();
         btn.setOnClickListener { go() }
         foundStart[u] = go
         foundHdr[u] = h
+        val cand = Cand(u, owner, meta, shownName, rw, row, host, Uri.parse(u).host ?: "", shownName)
+        cands[u] = cand
+        refreshInfo(cand)
+        rw.work = null
         val copy = pill("نسخ الرابط", false) { copyText(u) }
+        val watchB = pill("▶ مشاهدة", false) { watchRow(rw) }
+        watchB.visibility = View.GONE
+        rw.watch = watchB
         val btns = LinearLayout(this)
         btns.orientation = LinearLayout.HORIZONTAL
         btns.addView(btn, lp(WRAP, WRAP, 0f, 0, 0, 8, 0))
         btns.addView(copy)
+        btns.addView(watchB, lp(WRAP, WRAP, 0f, 8, 0, 0, 0))
         btns.addView(pauseB, lp(WRAP, WRAP, 0f, 8, 0, 0, 0))
         btns.addView(cancelB, lp(WRAP, WRAP, 0f, 8, 0, 0, 0))
 
         row.addView(title)
         row.addView(host)
         row.addView(btns, lp(MATCH, WRAP, 0f, 0, 8, 0, 0))
-        row.addView(bar, lp(MATCH, dp(8), 0f, 0, 8, 0, 0))
+        val btns2 = LinearLayout(this)
+        btns2.orientation = LinearLayout.HORIZONTAL
+        btns2.addView(pill("تصنيف: مسجل / مباشر", false) { cands[u]?.let { classifyDialog(it) } })
+        row.addView(btns2, lp(MATCH, WRAP, 0f, 0, 6, 0, 0))
+        row.addView(bar, lp(MATCH, WRAP, 0f, 0, 8, 0, 0))
         row.addView(msg, lp(MATCH, WRAP, 0f, 0, 4, 0, 0))
         list.addView(row, 0, lp(MATCH, WRAP, 0f, 0, 0, 0, 10))
         updateCounts()
@@ -1892,22 +4286,33 @@ scan();
             // مجلد ثابت لكل رابط: عند الفشل تبقى الأجزاء المكتملة ويكمل من حيث توقف
             val work = File(getExternalFilesDir(null) ?: filesDir, "work_" + Integer.toHexString(u.hashCode()))
             var keep = false
+            r.work = work
+            ui.post { r.watch?.visibility = View.VISIBLE }
             try {
                 work.mkdirs()
                 val name = "tango_" + System.currentTimeMillis()
-                val low = u.lowercase()
                 val result: String
-                if (low.contains(".m3u8") || low.contains("mpegurl")) {
+                val saved: Pair<String, String>
+                if (isHls(u)) {
                     val job = hls(u, h, work, ctl, progress)
                     ui.post { r.msg.text = "جاري دمج الأجزاء..." }
                     val out = merge(job, work, name)
-                    result = saveToDownloads(out, "video/mp4")
+                    saved = saveToDownloadsEx(out, "video/mp4")
+                } else if (isDash(u)) {
+                    val job = dash(u, h, work, ctl, progress)
+                    ui.post { r.msg.text = "جاري دمج الصوت والصورة..." }
+                    val out = mergeDash(job, work, name)
+                    saved = saveToDownloadsEx(out, "video/mp4")
                 } else {
-                    val mp4 = File(work, "$name.mp4")
+                    val nm = foundName[u]?.replace(Regex("[\\\\/:*?\"<>|]"), "_")
+                    val mp4 = File(work, if (nm.isNullOrBlank()) "$name.mp4" else nm)
                     direct(u, h, mp4, work, ctl, progress)
-                    result = saveToDownloads(mp4, "video/mp4")
+                    saved = saveToDownloadsEx(mp4, foundMime[u] ?: "video/mp4")
                 }
-                ui.post { r.msg.text = "تم: $result"; r.bar.progress = r.bar.max }
+                result = saved.first
+                r.finalLoc = saved.second
+                r.finalIsUri = saved.second.startsWith("content:")
+                ui.post { r.msg.text = "تم: $result"; r.bar.progress = r.bar.max; r.watch?.visibility = View.VISIBLE }
             } catch (e: CancelledException) {
                 ui.post {
                     r.msg.text = "أُلغي التحميل"
@@ -1925,13 +4330,457 @@ scan();
                 }
             } finally {
                 if (!keep) work.deleteRecursively()
+                if (!keep) r.work = null
                 ui.post {
+                    if (r.finalLoc == null && r.work == null) r.watch?.visibility = View.GONE
                     r.pause.visibility = View.GONE
                     r.cancel.visibility = View.GONE
                     setActive(r, false)
                 }
             }
         }
+    }
+
+    // ---------- DASH (.mpd) ----------
+
+    private class DRep(val id: String, val bw: Long, val w: Int, val h: Int, val init: String?, val segs: List<String>, val single: String?)
+    private class DashInfo(val live: Boolean, val dur: Double, val video: List<DRep>, val audio: List<DRep>, val drm: Boolean)
+    private class DashJob(val v: File, val a: File?)
+    private val dashSet = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+
+    private fun isDash(u: String): Boolean {
+        val b = u.substringBefore("#tdlrep=")
+        return b.lowercase().substringBefore('?').endsWith(".mpd") || dashSet.contains(b)
+    }
+
+    private fun isoDur(s: String?): Double {
+        if (s.isNullOrBlank()) return 0.0
+        val m = Regex("P(?:(\\d+)D)?(?:T(?:(\\d+)H)?(?:(\\d+)M)?(?:([\\d.]+)S)?)?").matchEntire(s.trim()) ?: return 0.0
+        val g = m.groupValues
+        return (g[1].toDoubleOrNull() ?: 0.0) * 86400 + (g[2].toDoubleOrNull() ?: 0.0) * 3600 +
+            (g[3].toDoubleOrNull() ?: 0.0) * 60 + (g[4].toDoubleOrNull() ?: 0.0)
+    }
+
+    private fun xKids(e: org.w3c.dom.Element, name: String): List<org.w3c.dom.Element> {
+        val out = ArrayList<org.w3c.dom.Element>()
+        val ns = e.childNodes
+        for (i in 0 until ns.length) {
+            val n = ns.item(i)
+            if (n is org.w3c.dom.Element && n.tagName.substringAfter(':') == name) out.add(n)
+        }
+        return out
+    }
+
+    private fun xBase(base: String, e: org.w3c.dom.Element): String {
+        val b = xKids(e, "BaseURL").firstOrNull()?.textContent?.trim()
+        return if (b.isNullOrEmpty()) base else absUrl(base, b)
+    }
+
+    private fun dashFill(t: String, id: String, bw: Long, number: Long, time: Long): String {
+        var r = t.replace("\$RepresentationID\$", id).replace("\$Bandwidth\$", bw.toString())
+        r = Regex("\\\$Number(?:%0(\\d+)d)?\\\$").replace(r) { m ->
+            number.toString().padStart(m.groupValues[1].toIntOrNull() ?: 0, '0')
+        }
+        r = Regex("\\\$Time(?:%0(\\d+)d)?\\\$").replace(r) { m ->
+            time.toString().padStart(m.groupValues[1].toIntOrNull() ?: 0, '0')
+        }
+        return r.replace("\$\$", "\$")
+    }
+
+    private fun parseMpd(u: String, xml: String): DashInfo {
+        val db = javax.xml.parsers.DocumentBuilderFactory.newInstance().newDocumentBuilder()
+        val doc = db.parse(org.xml.sax.InputSource(java.io.StringReader(xml)))
+        val root = doc.documentElement
+        val live = root.getAttribute("type") == "dynamic"
+        val total = isoDur(root.getAttribute("mediaPresentationDuration"))
+        var drm = false
+        val base0 = xBase(u, root)
+        var bestV: List<DRep> = emptyList()
+        var bestA: List<DRep> = emptyList()
+        var bestDur = -1.0
+        for (per in xKids(root, "Period")) {
+            val pBase = xBase(base0, per)
+            val pd0 = isoDur(per.getAttribute("duration"))
+            val pd = if (pd0 > 0) pd0 else total
+            val vs = ArrayList<DRep>()
+            val au = ArrayList<DRep>()
+            for (aset in xKids(per, "AdaptationSet")) {
+                val aBase = xBase(pBase, aset)
+                if (xKids(aset, "ContentProtection").isNotEmpty()) drm = true
+                for (rep in xKids(aset, "Representation")) {
+                    if (xKids(rep, "ContentProtection").isNotEmpty()) drm = true
+                    val mime = rep.getAttribute("mimeType").ifEmpty { aset.getAttribute("mimeType") }.lowercase()
+                    val ctype = aset.getAttribute("contentType").lowercase()
+                    val wd = rep.getAttribute("width").toIntOrNull() ?: aset.getAttribute("width").toIntOrNull() ?: 0
+                    val ht = rep.getAttribute("height").toIntOrNull() ?: aset.getAttribute("height").toIntOrNull() ?: 0
+                    val isA = mime.startsWith("audio") || ctype == "audio"
+                    val isV = mime.startsWith("video") || ctype == "video" || ht > 0
+                    if (!isA && !isV) continue
+                    val rid = rep.getAttribute("id")
+                    val bw = rep.getAttribute("bandwidth").toLongOrNull() ?: 0L
+                    val rBase = xBase(aBase, rep)
+                    val tmpl = xKids(rep, "SegmentTemplate").firstOrNull() ?: xKids(aset, "SegmentTemplate").firstOrNull()
+                    var init: String? = null
+                    val segs = ArrayList<String>()
+                    var single: String? = null
+                    if (tmpl != null) {
+                        val ts = tmpl.getAttribute("timescale").toLongOrNull() ?: 1L
+                        val sn = tmpl.getAttribute("startNumber").toLongOrNull() ?: 1L
+                        val media = tmpl.getAttribute("media")
+                        val ini = tmpl.getAttribute("initialization")
+                        if (ini.isNotEmpty()) init = absUrl(rBase, dashFill(ini, rid, bw, 0L, 0L))
+                        val tl = xKids(tmpl, "SegmentTimeline").firstOrNull()
+                        if (tl != null) {
+                            var t = 0L
+                            var num = sn
+                            var startT = -1L
+                            for (s in xKids(tl, "S")) {
+                                val st = s.getAttribute("t")
+                                if (st.isNotEmpty()) t = st.toLong()
+                                if (startT < 0) startT = t
+                                val d = s.getAttribute("d").toLongOrNull() ?: continue
+                                var rr = s.getAttribute("r").toIntOrNull() ?: 0
+                                if (rr < 0) {
+                                    rr = if (pd > 0 && d > 0) (((pd * ts - (t - startT)) / d).toInt() - 1).coerceAtLeast(0) else 0
+                                }
+                                for (k in 0..rr) {
+                                    segs.add(absUrl(rBase, dashFill(media, rid, bw, num, t)))
+                                    t += d
+                                    num++
+                                }
+                            }
+                        } else {
+                            val d = tmpl.getAttribute("duration").toLongOrNull() ?: 0L
+                            if (d > 0 && pd > 0) {
+                                val cnt = Math.ceil(pd * ts / d).toLong()
+                                for (k in 0 until cnt) segs.add(absUrl(rBase, dashFill(media, rid, bw, sn + k, k * d)))
+                            }
+                        }
+                    } else {
+                        val sl = xKids(rep, "SegmentList").firstOrNull() ?: xKids(aset, "SegmentList").firstOrNull()
+                        if (sl != null) {
+                            val src = xKids(sl, "Initialization").firstOrNull()?.getAttribute("sourceURL") ?: ""
+                            if (src.isNotEmpty()) init = absUrl(rBase, src)
+                            for (su in xKids(sl, "SegmentURL")) {
+                                val m = su.getAttribute("media")
+                                if (m.isNotEmpty()) segs.add(absUrl(rBase, m))
+                            }
+                        } else if (xKids(rep, "BaseURL").isNotEmpty()) {
+                            single = rBase
+                        }
+                    }
+                    if (single == null && segs.isEmpty()) continue
+                    val dr = DRep(rid, bw, wd, ht, init, segs, single)
+                    if (isA && !isV) au.add(dr) else vs.add(dr)
+                }
+            }
+            if (pd > bestDur) {
+                bestDur = pd
+                bestV = vs
+                bestA = au
+            }
+        }
+        return DashInfo(live, if (bestDur > 0) bestDur else total, bestV, bestA, drm)
+    }
+
+    private fun dashVariants(u: String, h: Map<String, String>): List<Variant> {
+        val base = u.substringBefore("#tdlrep=")
+        val info = parseMpd(base, text(base, h))
+        val ab = info.audio.maxByOrNull { it.bw }?.bw ?: 0L
+        return info.video.sortedByDescending { it.bw }.map {
+            val res = if (it.h > 0) it.h.toString() + "p" else ""
+            Variant((if (res.isNotEmpty()) res else "جودة") + " • " + (it.bw / 1000) + " kbps", base + "#tdlrep=" + it.id, it.bw + ab, res)
+        }
+    }
+
+    private fun dashRep(r: DRep, tag: String, work: File, h: Map<String, String>, ctl: Ctl,
+                        done: AtomicInteger, total: Int, progress: (Int, Int) -> Unit): File {
+        val out = File(work, "dash_$tag.mp4")
+        if (r.single != null) {
+            val sub = File(work, tag)
+            sub.mkdirs()
+            direct(r.single, h, out, sub, ctl) { d, t -> progress(d, t) }
+            return out
+        }
+        val iniF = r.init?.let { iu ->
+            val f = File(work, tag + "_init.mp4")
+            if (!(f.exists() && f.length() > 0)) f.writeBytes(retry(3) { bytes(iu, h) })
+            f
+        }
+        val parts = r.segs.indices.map { File(work, tag + "_%05d.seg".format(it)) }
+        val pool = Executors.newFixedThreadPool(prefs().getInt("threads", 8).coerceIn(1, 128))
+        try {
+            val fs = r.segs.mapIndexed { i, su ->
+                pool.submit(Callable<Unit> {
+                    gate(ctl)
+                    val part = parts[i]
+                    if (!(part.exists() && part.length() > 0)) {
+                        val d = retry(5) { gate(ctl); bytes(su, h) }
+                        ctl.bytes.addAndGet(d.size.toLong())
+                        throttle(d.size)
+                        val tmp = File(work, tag + "_%05d.tmp".format(i))
+                        tmp.writeBytes(d)
+                        if (!tmp.renameTo(part)) {
+                            part.writeBytes(d)
+                            tmp.delete()
+                        }
+                    }
+                    progress(done.incrementAndGet(), total)
+                })
+            }
+            for (f in fs) {
+                try {
+                    f.get()
+                } catch (e: ExecutionException) {
+                    val c = e.cause
+                    if (c is CancelledException) throw c
+                    throw Exception(c?.message ?: "فشل تحميل جزء")
+                }
+            }
+        } finally {
+            pool.shutdownNow()
+        }
+        out.outputStream().buffered().use { o ->
+            iniF?.inputStream()?.use { it.copyTo(o) }
+            for (p in parts) p.inputStream().use { it.copyTo(o) }
+        }
+        return out
+    }
+
+    private fun dash(u0: String, h: Map<String, String>, work: File, ctl: Ctl, progress: (Int, Int) -> Unit): DashJob {
+        val base = u0.substringBefore("#tdlrep=")
+        val want = u0.substringAfter("#tdlrep=", "")
+        val info = parseMpd(base, text(base, h))
+        if (info.drm && !prefs().getBoolean("ignoredrm", false)) throw Exception("الفيديو يعلن حماية DRM. لا يمكن فك هذا التشفير. للمحاولة رغم ذلك فعّل «محاولة التحميل رغم علامة DRM» من الإعدادات، أو انسخ الرابط وافتحه ببرنامج آخر")
+        val v = info.video.firstOrNull { it.id == want }
+            ?: (if (lowQ()) info.video.minByOrNull { it.bw } else info.video.maxByOrNull { it.bw })
+        val a = if (lowQ()) info.audio.minByOrNull { it.bw } else info.audio.maxByOrNull { it.bw }
+        if (v == null && a == null) throw Exception("لا توجد مسارات فيديو أو صوت في الملف")
+        val total = (v?.segs?.size ?: 0) + (a?.segs?.size ?: 0)
+        val done = AtomicInteger(0)
+        val vf = v?.let { dashRep(it, "dv", work, h, ctl, done, total, progress) }
+        val af = a?.let { dashRep(it, "da", work, h, ctl, done, total, progress) }
+        return DashJob(vf ?: af!!, if (vf != null) af else null)
+    }
+
+    // دمج مسار الصورة ومسار الصوت في ملف mp4 واحد: mp4parser أولاً، وMediaMuxer كبديل
+    private fun mergeDash(job: DashJob, work: File, name: String): File {
+        val out = File(work, "$name.mp4")
+        try {
+            val movie = Movie()
+            for (t in MovieCreator.build(job.v.absolutePath).tracks) movie.addTrack(t)
+            val a = job.a
+            if (a != null) {
+                for (t in MovieCreator.build(a.absolutePath).tracks) if (t.handler == "soun") movie.addTrack(t)
+            }
+            if (movie.tracks.isEmpty()) throw Exception("لا توجد مسارات")
+            val c = DefaultMp4Builder().build(movie)
+            FileOutputStream(out).use { fo -> c.writeContainer(fo.channel) }
+            return out
+        } catch (e: Throwable) {
+            out.delete()
+            logErr("دمج", "فشل دمج DASH عبر mp4parser، جاري تجربة MediaMuxer: " + (e.message ?: e.javaClass.simpleName), e)
+            val srcs = ArrayList<File>()
+            srcs.add(job.v)
+            job.a?.let { srcs.add(it) }
+            if (remuxMany(srcs, out)) return out
+            out.delete()
+            throw Exception("فشل دمج الصوت والصورة: " + (e.message ?: e.javaClass.simpleName))
+        }
+    }
+
+    private fun remuxMany(srcs: List<File>, mp4: File): Boolean {
+        var mux: MediaMuxer? = null
+        var started = false
+        try {
+            mux = MediaMuxer(mp4.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
+            val exs = ArrayList<MediaExtractor>()
+            val maps = ArrayList<HashMap<Int, Int>>()
+            var haveV = false
+            var haveA = false
+            for (s in srcs) {
+                val ex = MediaExtractor()
+                ex.setDataSource(s.absolutePath)
+                exs.add(ex)
+                val map = HashMap<Int, Int>()
+                for (i in 0 until ex.trackCount) {
+                    val f = ex.getTrackFormat(i)
+                    val mime = f.getString(MediaFormat.KEY_MIME) ?: continue
+                    if (mime.startsWith("video/") && !haveV) {
+                        map[i] = mux.addTrack(f); ex.selectTrack(i); haveV = true
+                    } else if (mime.startsWith("audio/") && !haveA) {
+                        map[i] = mux.addTrack(f); ex.selectTrack(i); haveA = true
+                    }
+                }
+                maps.add(map)
+            }
+            if (!haveV && !haveA) return false
+            mux.start()
+            started = true
+            val buf = ByteBuffer.allocate(4 * 1024 * 1024)
+            val info = MediaCodec.BufferInfo()
+            for (k in exs.indices) {
+                val ex = exs[k]
+                while (true) {
+                    val n = ex.readSampleData(buf, 0)
+                    if (n < 0) break
+                    info.offset = 0
+                    info.size = n
+                    info.presentationTimeUs = ex.sampleTime
+                    info.flags = if ((ex.sampleFlags and MediaExtractor.SAMPLE_FLAG_SYNC) != 0) MediaCodec.BUFFER_FLAG_KEY_FRAME else 0
+                    val t = maps[k][ex.sampleTrackIndex]
+                    if (t != null) mux.writeSampleData(t, buf, info)
+                    ex.advance()
+                }
+                try { ex.release() } catch (e: Exception) { }
+            }
+            mux.stop()
+            started = false
+            return true
+        } catch (e: Exception) {
+            return false
+        } finally {
+            try { if (started) mux?.stop() } catch (e: Exception) { }
+            try { mux?.release() } catch (e: Exception) { }
+        }
+    }
+
+    // ---------- فيديو مباشر بـ moov في آخر الملف: نجلب moov مبكراً لنتمكن من المشاهدة الجزئية ----------
+
+    private fun be32(b: ByteArray, o: Int): Long =
+        ((b[o].toLong() and 0xff) shl 24) or ((b[o + 1].toLong() and 0xff) shl 16) or ((b[o + 2].toLong() and 0xff) shl 8) or (b[o + 3].toLong() and 0xff)
+
+    private fun be64(b: ByteArray, o: Int): Long = (be32(b, o) shl 32) or be32(b, o + 4)
+
+    private fun put32(b: ByteArray, o: Int, v: Long) {
+        b[o] = (v shr 24).toByte(); b[o + 1] = (v shr 16).toByte(); b[o + 2] = (v shr 8).toByte(); b[o + 3] = v.toByte()
+    }
+
+    private fun put64(b: ByteArray, o: Int, v: Long) {
+        put32(b, o, v shr 32); put32(b, o + 4, v and 0xffffffffL)
+    }
+
+    private fun rangeBytes(u: String, h: Map<String, String>, a: Long, b: Long): ByteArray {
+        val c = conn(u, h, "bytes=$a-$b")
+        try {
+            if (c.responseCode != 206) throw Exception("الخادم لا يدعم التجزئة")
+            return c.inputStream.use { it.readBytes() }
+        } finally {
+            try { c.disconnect() } catch (e: Throwable) {}
+        }
+    }
+
+    private fun prepMoov(u: String, h: Map<String, String>, total: Long, work: File, n: Int, chunk: Long) {
+        try {
+            if (File(work, "moov.bin").exists()) return
+            var pos = 0L
+            var ftyp: ByteArray? = null
+            var mdatStart = -1L
+            var moovAt = -1L
+            var moovSz = 0L
+            var guard = 0
+            while (pos < total && guard++ < 64) {
+                val hd = rangeBytes(u, h, pos, minOf(pos + 15, total - 1))
+                if (hd.size < 8) break
+                var sz = be32(hd, 0)
+                val type = String(hd, 4, 4, Charsets.ISO_8859_1)
+                if (sz == 1L && hd.size >= 16) sz = be64(hd, 8) else if (sz == 0L) sz = total - pos
+                if (sz < 8) break
+                if (type == "ftyp" && sz < 4096) ftyp = rangeBytes(u, h, pos, pos + sz - 1)
+                if (type == "mdat" && mdatStart < 0) mdatStart = pos
+                if (type == "moov") {
+                    moovAt = pos
+                    moovSz = sz
+                    break
+                }
+                pos += sz
+            }
+            // moov قبل البيانات: بداية الملف تكفي للمشاهدة بدون أي معالجة
+            if (moovAt < 0 || mdatStart < 0 || moovAt < mdatStart || moovSz > 80L * 1048576L) return
+            val moov = rangeBytes(u, h, moovAt, moovAt + moovSz - 1)
+            File(work, "ftyp.bin").writeBytes(ftyp ?: ByteArray(0))
+            File(work, "moovmeta.txt").writeText("$mdatStart,$n,$chunk")
+            File(work, "moov.bin").writeBytes(moov)
+        } catch (e: Throwable) {
+        }
+    }
+
+    // يضبط مواضع الأجزاء (stco/co64) داخل moov بعد نقله لبداية الملف
+    private fun patchMoov(m: ByteArray, delta: Long) {
+        fun walk(start: Int, end: Int) {
+            var p = start
+            while (p + 8 <= end) {
+                val sz = be32(m, p).toInt()
+                if (sz < 8 || p + sz > end) break
+                when (String(m, p + 4, 4, Charsets.ISO_8859_1)) {
+                    "trak", "mdia", "minf", "stbl" -> walk(p + 8, p + sz)
+                    "stco" -> {
+                        val cnt = be32(m, p + 12).toInt()
+                        for (i in 0 until cnt) {
+                            val o = p + 16 + i * 4
+                            if (o + 4 > p + sz) break
+                            put32(m, o, be32(m, o) + delta)
+                        }
+                    }
+                    "co64" -> {
+                        val cnt = be32(m, p + 12).toInt()
+                        for (i in 0 until cnt) {
+                            val o = p + 16 + i * 8
+                            if (o + 8 > p + sz) break
+                            put64(m, o, be64(m, o) + delta)
+                        }
+                    }
+                }
+                p += sz
+            }
+        }
+        val hl = if (be32(m, 0) == 1L) 16 else 8
+        walk(hl, m.size)
+    }
+
+    private fun previewDirect(dir: File, pdir: File): File? {
+        val mf = File(dir, "moovmeta.txt")
+        if (mf.exists() && File(dir, "moov.bin").exists()) {
+            val meta = mf.readText().split(",")
+            val mdatStart = meta[0].toLong()
+            val n = meta[1].toInt()
+            val chunk = meta[2].toLong()
+            val files = ArrayList<File>()
+            var avail = 0L
+            for (k in 0 until n) {
+                val f = File(dir, "chunk_" + k + ".part")
+                if (!f.exists()) break
+                files.add(f)
+                avail += f.length()
+                if (f.length() < chunk) break
+            }
+            if (avail <= mdatStart + 64) return null
+            val moov = File(dir, "moov.bin").readBytes()
+            val ftyp = File(dir, "ftyp.bin").readBytes()
+            patchMoov(moov, (ftyp.size + moov.size).toLong() - mdatStart)
+            pdir.mkdirs()
+            val out = File(pdir, "preview.mp4")
+            out.outputStream().buffered().use { o ->
+                o.write(ftyp)
+                o.write(moov)
+                var pos = 0L
+                for (f in files) {
+                    val len = f.length()
+                    if (pos + len > mdatStart) {
+                        val startIn = maxOf(0L, mdatStart - pos)
+                        java.io.FileInputStream(f).use { i ->
+                            i.channel.position(startIn)
+                            i.copyTo(o)
+                        }
+                    }
+                    pos += len
+                }
+            }
+            return out
+        }
+        val c0 = File(dir, "chunk_0.part")
+        if (c0.exists() && c0.length() > 0) return c0
+        return dir.listFiles()?.filter { it.name.endsWith(".mp4") && it.length() > 0 }?.maxByOrNull { it.length() }
     }
 
     // ---------- الشبكة ----------
@@ -1941,26 +4790,84 @@ scan();
     )
 
     private val probed = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
-    private val prober = Executors.newFixedThreadPool(2)
+    private val prober = java.util.concurrent.ThreadPoolExecutor(
+        8, 8, 30L, java.util.concurrent.TimeUnit.SECONDS,
+        java.util.concurrent.LinkedBlockingQueue<Runnable>()
+    ).also { it.allowCoreThreadTimeOut(true) }
+    private fun applyPools() {
+        val a = prefs().getInt("anthreads", 16).coerceAtLeast(1)
+        val b = prefs().getInt("prthreads", 8).coerceAtLeast(1)
+        try { analyzer.maximumPoolSize = maxOf(a, analyzer.corePoolSize); analyzer.corePoolSize = a; analyzer.maximumPoolSize = a } catch (e: Throwable) {}
+        try { prober.maximumPoolSize = maxOf(b, prober.corePoolSize); prober.corePoolSize = b; prober.maximumPoolSize = b } catch (e: Throwable) {}
+    }
     private val staticExt = listOf(
         ".js", ".css", ".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp", ".woff", ".woff2", ".ttf",
-        ".ico", ".html", ".ts", ".m4s", ".aac", ".mp3", ".webm", ".map"
+        ".ico", ".html", ".map"
     )
+    private val audioExt = listOf(".mp3", ".aac", ".m4a", ".ogg", ".oga", ".opus", ".wav", ".flac", ".weba")
+    private val segExt = listOf(".ts", ".m4s")
+    private fun capAudio() = prefs().getBoolean("capaudio", true)
+    private fun capSeg() = prefs().getBoolean("capseg", true)
+    private fun showKnownSeg() = prefs().getBoolean("showseg", false)
+    private fun customHdrs(): List<Pair<String, String>> =
+        prefs().getString("customhdr", "")!!.lines().mapNotNull {
+            val i = it.indexOf(':')
+            if (i <= 0) null else Pair(it.substring(0, i).trim(), it.substring(i + 1).trim())
+        }.filter { it.first.isNotEmpty() }
+    private val videoExt = listOf(".mp4", ".m4v", ".mov", ".webm", ".mkv", ".flv", ".3gp", ".avi", ".wmv", ".ogv")
 
-    private fun probe(u: String, h: Map<String, String>) {
-        if (probed.size > 5000 || !probed.add(u)) return
-        prober.execute {
-            try {
-                val c = URL(u).openConnection() as HttpURLConnection
-                c.requestMethod = "HEAD"
-                c.connectTimeout = 5000
-                c.readTimeout = 5000
-                for ((k, v) in h) if (v.isNotEmpty()) c.setRequestProperty(k, v)
-                val t = (c.contentType ?: "").lowercase()
-                c.disconnect()
-                if (t.contains("mpegurl")) ui.post { addFound(u, h) }
-            } catch (e: Exception) {
+    private class ProbeRes(val code: Int, val ct: String, val len: Long)
+
+    private fun probeReq(u: String, h: Map<String, String>, head: Boolean): ProbeRes? {
+        var c: HttpURLConnection? = null
+        try {
+            val k = URL(u).openConnection() as HttpURLConnection
+            c = k
+            k.connectTimeout = 8000
+            k.readTimeout = 8000
+            if (head) k.requestMethod = "HEAD"
+            for ((a, b) in h) if (b.isNotEmpty() && a.lowercase() !in skipHeaders) k.setRequestProperty(a, b)
+            for ((ck, cv) in customHdrs()) k.setRequestProperty(ck, cv)
+            if (!head) k.setRequestProperty("Range", "bytes=0-0")
+            val code = k.responseCode
+            val ct = k.contentType ?: ""
+            val len = if (code == 206) (k.getHeaderField("Content-Range") ?: "").substringAfterLast('/', "").trim().toLongOrNull() ?: -1L
+            else k.contentLengthLong
+            return ProbeRes(code, ct, len)
+        } catch (e: Exception) {
+            return null
+        } finally {
+            try { c?.disconnect() } catch (e: Throwable) {}
+        }
+    }
+
+    private fun probeIsVideo(ct: String, len: Long, u: String): Boolean {
+        val t = ct.lowercase()
+        if (t.contains("mpegurl") || t.contains("dash+xml") || t.startsWith("video/") || (t.startsWith("audio/") && capAudio())) return true
+        if (t.contains("octet-stream") || t.startsWith("binary/")) {
+            val p = u.lowercase().substringBefore('?').substringBefore('#')
+            val bad = listOf(".zip", ".apk", ".rar", ".7z", ".exe", ".pdf", ".iso", ".dmg", ".gz", ".tar", ".bin", ".jar", ".torrent")
+            if (bad.any { p.endsWith(it) }) return false
+            val big = len < 0 || len > 300000L
+            return big && (videoExt.any { p.endsWith(it) } || Regex("video|stream|media|play|mp4|movie|film|vod").containsMatchIn(p))
+        }
+        return false
+    }
+
+    // فحص رأس الرد للطلبات التي لا تبدو ملفات ثابتة: HEAD أولاً، وإن رفضه الخادم نجرب GET ببايت واحد
+    private fun probe(u: String, h: Map<String, String>, v: WebView) {
+        if (!probed.add(u)) return
+        try {
+            prober.execute {
+                try {
+                    var r = probeReq(u, h, true)
+                    if (r == null || r.code !in 200..299) r = probeReq(u, h, false)
+                    if (r != null && r.code in 200..299 && probeIsVideo(r.ct, r.len, u)) ui.post { consider(u, h, v) }
+                } catch (e: Throwable) {
+                }
             }
+        } catch (e: Throwable) {
+            probed.remove(u) // الطابور ممتلئ: نسمح بإعادة الفحص لاحقاً بدل أن نخسر الرابط
         }
     }
 
@@ -1985,14 +4892,16 @@ scan();
     // نفس الهيدرز (User-Agent / Referer / Cookie ...) لكل طلب، مع متابعة التحويلات يدوياً
     private fun conn(u0: String, h: Map<String, String>, range: String? = null): HttpURLConnection {
         var u = u0
-        for (hop in 0..5) {
+        val maxHop = prefs().getInt("redirects", 30).let { if (it <= 0) 100000 else it }
+        for (hop in 0..maxHop) {
             val c = URL(u).openConnection() as HttpURLConnection
-            c.connectTimeout = 30000
-            c.readTimeout = 60000
+            c.connectTimeout = prefs().getInt("conntimeout", 45) * 1000
+            c.readTimeout = prefs().getInt("readtimeout", 120) * 1000
             c.instanceFollowRedirects = false
             for ((k, v) in h) {
                 if (v.isNotEmpty() && k.lowercase() !in skipHeaders) c.setRequestProperty(k, v)
             }
+            for ((ck, cv) in customHdrs()) c.setRequestProperty(ck, cv)
             c.setRequestProperty("Accept-Encoding", "identity")
             if (range != null) c.setRequestProperty("Range", range)
             val code = c.responseCode
@@ -2054,6 +4963,7 @@ scan();
                         o.write(buf, 0, n)
                         done += n
                         ctl.bytes.addAndGet(n.toLong())
+                        throttle(n)
                         if (tl > 0) progress((done * 100 / tl).toInt(), 100) else progress(0, 0)
                     }
                 }
@@ -2062,9 +4972,12 @@ scan();
         }
 
         // تحميل متوازٍ: كل جزء من الملف في اتصال مستقل، وكل جزء قابل للاستئناف
-        val n = prefs().getInt("threads", 3).coerceIn(2, 6)
+        // خوارزمية ذكية: عدد الاتصالات = ما اخترته لكن لا يقل نصيب الاتصال عن 1 م.ب (حتى لا تُهدر اتصالات على ملف صغير)
+        val want = prefs().getInt("threads", 8).coerceIn(2, 128)
+        val n = minOf(want, maxOf(2, (total / (1024L * 1024)).toInt()))
         val size = (total + n - 1) / n
         val got = java.util.concurrent.atomic.AtomicLong(0)
+        prepMoov(u, h, total, work, n, size)
         val files = ArrayList<File>()
         for (k in 0 until n) files.add(File(work, "chunk_" + k + ".part"))
         for (f in files) got.addAndGet(f.length())
@@ -2093,6 +5006,7 @@ scan();
                                         o.write(buf, 0, m)
                                         val g = got.addAndGet(m.toLong())
                                         ctl.bytes.addAndGet(m.toLong())
+                        throttle(m)
                                         progress((g * 100 / total).toInt(), 100)
                                     }
                                 }
@@ -2101,13 +5015,13 @@ scan();
                             throw e
                         } catch (e: Exception) {
                             tries++
-                            if (tries > 6) throw e
-                            Thread.sleep(600L * tries)
+                            if (tries > 20) throw e
+                            Thread.sleep(minOf(600L * tries, 6000L))
                         }
                         if (f.length() == have) {
                             tries++
-                            if (tries > 6) throw Exception("توقف وصول البيانات من الخادم")
-                            Thread.sleep(600L * tries)
+                            if (tries > 20) throw Exception("توقف وصول البيانات من الخادم")
+                            Thread.sleep(minOf(600L * tries, 6000L))
                         }
                     }
                 })
@@ -2189,8 +5103,11 @@ scan();
                     val ka = absUrl(url, ku)
                     curKey = keyCache.getOrPut(ka) { retry(3) { bytes(ka, h) } }
                     curIv = Regex("IV=0x([0-9A-Fa-f]+)").find(l)?.groupValues?.get(1)
+                } else if (prefs().getBoolean("ignoreenc", false)) {
+                    curKey = null
+                    curIv = null
                 } else {
-                    throw Exception("نوع تشفير غير مدعوم: $method")
+                    throw Exception("نوع تشفير غير مدعوم: $method. فعّل «تحميل خام عند تشفير HLS غير مدعوم» من الإعدادات لحفظ الأجزاء كما هي، أو انسخ الرابط")
                 }
             } else if (l.startsWith("#EXT-X-MAP")) {
                 val mu = Regex("URI=\"([^\"]+)\"").find(l)?.groupValues?.get(1)
@@ -2202,11 +5119,21 @@ scan();
         }
         if (segs.isEmpty()) throw Exception("القائمة فاضية")
 
+        // نحمّل ملف التهيئة أولاً (يلزم لمشاهدة الجزء المحمّل قبل اكتمال التحميل)
+        val initFile = initUrl?.let { iu ->
+            val f = File(work, "init.mp4")
+            if (!(f.exists() && f.length() > 0)) f.writeBytes(retry(3) { bytes(iu, h) })
+            f
+        }
+        val ext = segs[0].url.substringBefore('?').substringAfterLast('.').lowercase()
+        val mp4Family = initFile != null || ext in setOf("mp4", "m4s", "m4v", "m4a", "cmfv", "cmfa")
+        try { if (mp4Family) File(work, "fam_mp4").writeText("1") } catch (e: Throwable) {}
+
         // كل جزء يُحفظ في ملف برقمه (part_00000.seg ...) لضمان الترتيب وعدم ملء الذاكرة
         val parts = ArrayList<File>()
         for (s in segs) parts.add(File(work, "part_%05d.seg".format(s.index)))
         val done = AtomicInteger(0)
-        val pool = Executors.newFixedThreadPool(prefs().getInt("threads", 3).coerceIn(1, 6))
+        val pool = Executors.newFixedThreadPool(prefs().getInt("threads", 8).coerceIn(1, 128))
         try {
             val futures = segs.map { s ->
                 pool.submit(Callable<Unit> {
@@ -2216,6 +5143,7 @@ scan();
                     if (!(part.exists() && part.length() > 0)) {
                         var d = retry(5) { gate(ctl); bytes(s.url, h) }
                         ctl.bytes.addAndGet(d.size.toLong())
+                        throttle(d.size)
                         if (s.key != null) {
                             val c = Cipher.getInstance("AES/CBC/PKCS5Padding")
                             c.init(Cipher.DECRYPT_MODE, SecretKeySpec(s.key, "AES"), IvParameterSpec(s.iv))
@@ -2244,13 +5172,6 @@ scan();
             pool.shutdownNow()
         }
 
-        val initFile = initUrl?.let { iu ->
-            val f = File(work, "init.mp4")
-            f.writeBytes(retry(3) { bytes(iu, h) })
-            f
-        }
-        val ext = segs[0].url.substringBefore('?').substringAfterLast('.').lowercase()
-        val mp4Family = initFile != null || ext in setOf("mp4", "m4s", "m4v", "m4a", "cmfv", "cmfa")
         return HlsJob(parts, initFile, mp4Family)
     }
 
@@ -2486,7 +5407,10 @@ scan();
     }
 
     // ينقل الملف النهائي إلى مجلد التحميلات (Download)
-    private fun saveToDownloads(f: File, mime: String): String {
+    private fun saveToDownloads(f: File, mime: String): String = saveToDownloadsEx(f, mime).first
+
+    // يرجع (وصف المكان، رابط/مسار الملف النهائي للمشاهدة)
+    private fun saveToDownloadsEx(f: File, mime: String): Pair<String, String> {
         if (Build.VERSION.SDK_INT >= 29) {
             val v = ContentValues()
             v.put(MediaStore.Downloads.DISPLAY_NAME, f.name)
@@ -2502,13 +5426,520 @@ scan();
             done.put(MediaStore.Downloads.IS_PENDING, 0)
             contentResolver.update(uri, done, null, null)
             f.delete()
-            return "Download/" + f.name
+            return Pair("Download/" + f.name, uri.toString())
         }
         val d = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
         d.mkdirs()
         val out = File(d, f.name)
         f.copyTo(out, true)
         f.delete()
-        return out.absolutePath
+        return Pair(out.absolutePath, out.absolutePath)
+    }
+
+    // ---------- المتصفح الحقيقي: ملفات وصلاحيات وملء الشاشة وتحميل ----------
+
+    private fun askWebPermission(r: PermissionRequest) {
+        val need = ArrayList<String>()
+        val names = ArrayList<String>()
+        for (x in r.resources) {
+            if (x == PermissionRequest.RESOURCE_VIDEO_CAPTURE) {
+                need.add(android.Manifest.permission.CAMERA)
+                names.add("الكاميرا")
+            } else if (x == PermissionRequest.RESOURCE_AUDIO_CAPTURE) {
+                need.add(android.Manifest.permission.RECORD_AUDIO)
+                names.add("الميكروفون")
+            }
+        }
+        if (need.isEmpty()) {
+            try { r.grant(r.resources) } catch (e: Throwable) {}
+            return
+        }
+        AlertDialog.Builder(this).setTitle("إذن الموقع")
+            .setMessage((r.origin.host ?: "الموقع") + " يطلب استخدام " + names.joinToString(" و "))
+            .setPositiveButton("سماح") { _, _ ->
+                val miss = need.filter { Build.VERSION.SDK_INT >= 23 && checkSelfPermission(it) != android.content.pm.PackageManager.PERMISSION_GRANTED }
+                if (miss.isEmpty()) {
+                    try { r.grant(r.resources) } catch (e: Throwable) {}
+                } else {
+                    permReq = r
+                    requestPermissions(miss.toTypedArray(), 80)
+                }
+            }
+            .setNegativeButton("منع") { _, _ -> try { r.deny() } catch (e: Throwable) {} }
+            .setOnCancelListener { try { r.deny() } catch (e: Throwable) {} }
+            .show()
+    }
+
+    override fun onRequestPermissionsResult(code: Int, perms: Array<out String>, res: IntArray) {
+        super.onRequestPermissionsResult(code, perms, res)
+        if (code == 78) {
+            val ok = res.isNotEmpty() && res.any { it == android.content.pm.PackageManager.PERMISSION_GRANTED }
+            try { geoCb?.invoke(geoOrigin, ok, false) } catch (e: Throwable) {}
+            geoCb = null
+        } else if (code == 80) {
+            val r = permReq
+            permReq = null
+            if (r != null) {
+                val ok = res.isNotEmpty() && res.all { it == android.content.pm.PackageManager.PERMISSION_GRANTED }
+                try { if (ok) r.grant(r.resources) else r.deny() } catch (e: Throwable) {}
+            }
+        }
+    }
+
+    @Suppress("DEPRECATION")
+    override fun onActivityResult(req: Int, res: Int, data: Intent?) {
+        if (req == 77) {
+            val cb = fileCb
+            fileCb = null
+            cb?.onReceiveValue(WebChromeClient.FileChooserParams.parseResult(res, data))
+            return
+        }
+        if (req == 79) {
+            val u = data?.data
+            if (res == RESULT_OK && u != null) {
+                try { contentResolver.takePersistableUriPermission(u, Intent.FLAG_GRANT_READ_URI_PERMISSION) } catch (e: Throwable) {}
+                openViewer(u)
+            }
+            return
+        }
+        super.onActivityResult(req, res, data)
+    }
+
+    private fun showFull(v: View, cb: WebChromeClient.CustomViewCallback) {
+        if (fullView != null) {
+            cb.onCustomViewHidden()
+            return
+        }
+        fullView = v
+        fullCb = cb
+        v.setBackgroundColor(Color.BLACK)
+        (window.decorView as ViewGroup).addView(v, FrameLayout.LayoutParams(MATCH, MATCH))
+        fullFlags = window.decorView.systemUiVisibility
+        window.decorView.systemUiVisibility = View.SYSTEM_UI_FLAG_FULLSCREEN or View.SYSTEM_UI_FLAG_HIDE_NAVIGATION or
+            View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY or View.SYSTEM_UI_FLAG_LAYOUT_STABLE
+    }
+
+    private fun hideFull() {
+        val v = fullView ?: return
+        fullView = null
+        try { (window.decorView as ViewGroup).removeView(v) } catch (e: Throwable) {}
+        window.decorView.systemUiVisibility = fullFlags
+        try { fullCb?.onCustomViewHidden() } catch (e: Throwable) {}
+        fullCb = null
+    }
+
+    // أي ملف يطلب الموقع تنزيله: يدخل محرك التحميل السريع ويبدأ فوراً
+    private fun onWebDownload(url: String, ua: String?, cd: String?, mime: String?, len: Long) {
+        val name = URLUtil.guessFileName(url, cd, mime)
+        if (url.startsWith("blob:")) {
+            fetchBlob(url, name, mime ?: "")
+            return
+        }
+        if (!(url.startsWith("http://") || url.startsWith("https://"))) {
+            toast("هذا النوع من الروابط غير مدعوم للتحميل")
+            return
+        }
+        val h = HashMap<String, String>()
+        h["User-Agent"] = if (!ua.isNullOrEmpty()) ua else curUa
+        h["Referer"] = cur?.web?.url ?: ""
+        h["Cookie"] = CookieManager.getInstance().getCookie(url) ?: ""
+        foundName[url] = name
+        foundMime[url] = if (!mime.isNullOrEmpty() && mime != "application/octet-stream") mime else FileUtil.mimeOf(name)
+        addFound(url, h, Meta(true, -1.0, len, false, "", 0L, emptyList()), cur, name)
+        foundStart[url]?.invoke()
+        showPage(1)
+        toast("بدأ تحميل: " + name)
+    }
+
+    private fun fetchBlob(url: String, name: String, mime: String) {
+        val w = cur?.web ?: return
+        val js = "(function(){var u=" + org.json.JSONObject.quote(url) + ";fetch(u).then(function(r){return r.blob();}).then(function(b){" +
+            "var id=String(Date.now());var size=b.size;var ch=393216;var i=0;" +
+            "function nx(){if(i>=size){TDL.blobEnd(id," + org.json.JSONObject.quote(name) + "," + org.json.JSONObject.quote(mime) + ");return;}" +
+            "var fr=new FileReader();fr.onload=function(){var d=fr.result;TDL.blobPart(id,d.substring(d.indexOf(',')+1));i+=ch;nx();};" +
+            "fr.onerror=function(){TDL.err('blob read');};fr.readAsDataURL(b.slice(i,i+ch));}" +
+            "if(size==0){TDL.err('blob empty');return;}nx();}).catch(function(e){TDL.err('blob: '+e);});})();"
+        w.evaluateJavascript(js, null)
+        toast("جاري حفظ الملف...")
+    }
+
+    private fun openStorage() {
+        startActivity(Intent(this, StorageActivity::class.java))
+    }
+
+    private fun openViewer(u: Uri) {
+        val i = Intent(this, ViewerActivity::class.java)
+        i.data = u
+        startActivity(i)
+    }
+
+    private fun openHtmlFile() {
+        val i = Intent(Intent.ACTION_OPEN_DOCUMENT)
+        i.addCategory(Intent.CATEGORY_OPENABLE)
+        i.type = "*/*"
+        try {
+            startActivityForResult(i, 79)
+        } catch (e: Throwable) {
+            toast("تعذر فتح منتقي الملفات")
+        }
+    }
+
+    // ---------- التحكم الحر بالسرعة ----------
+
+    private fun labeledSeek(col: LinearLayout, title: String, min: Int, max: Int, start: Int, fmt: (Int) -> String, onStop: (Int) -> Unit): SeekBar {
+        val t = tv(title + ": " + fmt(start), 13f, cText, true)
+        col.addView(t, lp(MATCH, WRAP, 0f, 0, 10, 0, 2))
+        val s = SeekBar(this)
+        s.max = max - min
+        s.progress = (start - min).coerceIn(0, max - min)
+        s.progressTintList = ColorStateList.valueOf(cAccent)
+        s.thumbTintList = ColorStateList.valueOf(cAccent)
+        s.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+            override fun onProgressChanged(sb: SeekBar, p: Int, u: Boolean) {
+                t.text = title + ": " + fmt(p + min)
+            }
+
+            override fun onStartTrackingTouch(sb: SeekBar) {}
+
+            override fun onStopTrackingTouch(sb: SeekBar) {
+                onStop(sb.progress + min)
+            }
+        })
+        col.addView(s, lp(MATCH, WRAP))
+        return s
+    }
+
+    private fun showSpeed() {
+        val col = LinearLayout(this)
+        col.orientation = LinearLayout.VERTICAL
+        col.setBackgroundColor(cCard)
+        col.setPadding(dp(20), dp(12), dp(20), dp(8))
+        col.addView(tv("حد السرعة الكلي (كيلوبايت في الثانية)", 13f, cText, true))
+        val noLim = android.widget.CheckBox(this)
+        noLim.text = "بلا حد (أقصى سرعة ممكنة)"
+        noLim.isChecked = prefs().getInt("limitkb", 0) == 0
+        col.addView(noLim)
+        val lim = EditText(this)
+        lim.inputType = InputType.TYPE_CLASS_NUMBER
+        lim.setText("" + prefs().getInt("limitkb", 0).let { if (it > 0) it else 1024 })
+        lim.visibility = if (noLim.isChecked) View.GONE else View.VISIBLE
+        noLim.setOnCheckedChangeListener { _, on -> lim.visibility = if (on) View.GONE else View.VISIBLE }
+        lim.setTextColor(cText)
+        lim.background = bg(cBg, 10, cLine)
+        lim.setPadding(dp(12), dp(8), dp(12), dp(8))
+        lim.layoutDirection = View.LAYOUT_DIRECTION_LTR
+        col.addView(lim, lp(MATCH, WRAP, 0f, 0, 6, 0, 0))
+        col.addView(tv("مثال: 1024 = 1 م.ب/ث ، 10240 = 10 م.ب/ث", 11f, cMuted))
+        val sT = labeledSeek(col, "اتصالات الملف الواحد", 1, 128, prefs().getInt("threads", 8).coerceIn(1, 128), { "" + it }, { })
+        val sP = labeledSeek(col, "تحميلات متزامنة", 1, 32, prefs().getInt("parallel", 3).coerceIn(1, 32), { "" + it }, { })
+        col.addView(tv("الاتصالات تُقلَّل تلقائياً للملفات الصغيرة حتى لا تُهدر.", 11f, cMuted), lp(MATCH, WRAP, 0f, 0, 10, 0, 0))
+        val sv = ScrollView(this)
+        sv.addView(col)
+        AlertDialog.Builder(this).setTitle("التحكم بالسرعة").setView(sv)
+            .setPositiveButton("حفظ") { _, _ ->
+                val v = if (noLim.isChecked) 0 else (lim.text.toString().trim().toLongOrNull() ?: 1024L).coerceIn(1L, 10000000L).toInt()
+                prefs().edit().putInt("limitkb", v).putInt("threads", sT.progress + 1).putInt("parallel", sP.progress + 1).apply()
+                limitKb = v
+                applyParallel()
+                toast("تم الحفظ")
+            }
+            .setNeutralButton("سرعة فائقة") { _, _ ->
+                prefs().edit().putInt("limitkb", 0).putInt("threads", 64).putInt("parallel", 6).apply()
+                limitKb = 0
+                applyParallel()
+                toast("تم تفعيل السرعة الفائقة بلا حد")
+            }
+            .setNegativeButton("إلغاء", null).show()
+    }
+
+    // قياس السرعة الفعلية بعدة اتصالات متوازية ثم اقتراح عدد الاتصالات الأنسب
+    private fun speedTest() {
+        toast("جاري قياس السرعة لمدة 6 ثوانٍ...")
+        Thread {
+            val total = java.util.concurrent.atomic.AtomicLong(0)
+            val t0 = System.nanoTime()
+            val end = t0 + 6000000000L
+            val ex = Executors.newFixedThreadPool(4)
+            val fs = ArrayList<java.util.concurrent.Future<*>>()
+            for (k in 0 until 4) {
+                fs.add(ex.submit(Runnable {
+                    try {
+                        val c = URL("https://speed.cloudflare.com/__down?bytes=100000000").openConnection() as HttpURLConnection
+                        c.connectTimeout = 15000
+                        c.readTimeout = 15000
+                        c.inputStream.use { i ->
+                            val b = ByteArray(65536)
+                            while (System.nanoTime() < end) {
+                                val n = i.read(b)
+                                if (n < 0) break
+                                total.addAndGet(n.toLong())
+                            }
+                        }
+                        c.disconnect()
+                    } catch (e: Throwable) {
+                    }
+                }))
+            }
+            for (f in fs) try { f.get() } catch (e: Throwable) {}
+            ex.shutdownNow()
+            val sec = (System.nanoTime() - t0) / 1e9
+            val bps = if (sec > 0) total.get() / sec else 0.0
+            val rec = when {
+                bps < 100 * 1024 -> 0
+                bps < 256 * 1024 -> 2
+                bps < 1024 * 1024 -> 4
+                bps < 4 * 1024 * 1024 -> 8
+                bps < 12 * 1024 * 1024 -> 16
+                else -> 32
+            }
+            ui.post {
+                if (rec == 0) {
+                    AlertDialog.Builder(this).setTitle("نتيجة القياس")
+                        .setMessage("لم أتمكن من القياس (الشبكة بطيئة جداً أو منقطعة). التطبيق يعمل مع الشبكات الضعيفة بمهل طويلة وإعادة محاولة تلقائية.")
+                        .setPositiveButton("حسناً", null).show()
+                } else {
+                    val mb = String.format(java.util.Locale.US, "%.2f", bps / 1048576.0)
+                    val mbit = String.format(java.util.Locale.US, "%.1f", bps * 8 / 1000000.0)
+                    AlertDialog.Builder(this).setTitle("نتيجة القياس")
+                        .setMessage("السرعة: " + mb + " م.ب/ث (" + mbit + " ميغابت/ث)\nعدد الاتصالات المقترح: " + rec)
+                        .setPositiveButton("تطبيق المقترح") { _, _ ->
+                            prefs().edit().putInt("threads", rec).apply()
+                            toast("تم ضبط الاتصالات على " + rec)
+                        }
+                        .setNegativeButton("إغلاق", null).show()
+                }
+            }
+        }.start()
+    }
+
+    // فحص رابط: الحالة والنوع والحجم ودعم التجزئة والتحويلات
+    private fun inspectLink() {
+        val et = EditText(this)
+        et.setTextColor(cText)
+        et.setHintTextColor(cMuted)
+        et.hint = "https://..."
+        et.layoutDirection = View.LAYOUT_DIRECTION_LTR
+        et.inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI
+        val c = clipText()
+        if (c.startsWith("http")) et.setText(c)
+        val box = LinearLayout(this)
+        box.setBackgroundColor(cCard)
+        box.setPadding(dp(18), dp(10), dp(18), dp(10))
+        box.addView(et, lp(MATCH, WRAP))
+        AlertDialog.Builder(this).setTitle("فحص رابط").setView(box)
+            .setPositiveButton("فحص") { _, _ ->
+                val u = et.text.toString().trim()
+                if (!(u.startsWith("http://") || u.startsWith("https://"))) {
+                    toast("أدخل رابطاً صحيحاً")
+                    return@setPositiveButton
+                }
+                toast("جاري الفحص...")
+                Thread {
+                    var msg = ""
+                    try {
+                        val h = HashMap<String, String>()
+                        h["User-Agent"] = curUa
+                        h["Referer"] = cur?.web?.url ?: ""
+                        h["Cookie"] = CookieManager.getInstance().getCookie(u) ?: ""
+                        val cn = conn(u, h, "bytes=0-0")
+                        val code = cn.responseCode
+                        val ct = cn.contentType ?: "غير معروف"
+                        val total = if (code == 206) (cn.getHeaderField("Content-Range") ?: "").substringAfterLast('/', "").trim().toLongOrNull() ?: -1L else cn.contentLengthLong
+                        val ranges = code == 206 || (cn.getHeaderField("Accept-Ranges") ?: "").contains("bytes")
+                        val fin = cn.url.toString()
+                        cn.disconnect()
+                        msg = "الحالة: " + code + "\nالنوع: " + ct + "\nالحجم: " + (if (total > 0) FileUtil.fmtSize(total) else "غير معروف") +
+                            "\nالتحميل المتجزئ السريع: " + (if (ranges) "مدعوم" else "غير مدعوم") +
+                            (if (fin != u) "\nالرابط النهائي بعد التحويل:\n" + fin else "")
+                    } catch (e: Throwable) {
+                        msg = "تعذر الفحص: " + (e.message ?: e.javaClass.simpleName)
+                    }
+                    val m = msg
+                    ui.post {
+                        AlertDialog.Builder(this).setTitle("نتيجة الفحص").setMessage(m)
+                            .setPositiveButton("إضافة للتحميلات") { _, _ ->
+                                val h = HashMap<String, String>()
+                                h["User-Agent"] = curUa
+                                h["Referer"] = cur?.web?.url ?: ""
+                                h["Cookie"] = CookieManager.getInstance().getCookie(u) ?: ""
+                                addFound(u, h, null, cur, "")
+                                showPage(1)
+                            }
+                            .setNegativeButton("إغلاق", null).show()
+                    }
+                }.start()
+            }
+            .setNegativeButton("إلغاء", null).show()
+    }
+
+    // لصق عدة روابط دفعة واحدة وتحميلها كلها
+    private fun batchLinks() {
+        val et = EditText(this)
+        et.setTextColor(cText)
+        et.setHintTextColor(cMuted)
+        et.hint = "ألصق الروابط هنا، رابط في كل سطر"
+        et.layoutDirection = View.LAYOUT_DIRECTION_LTR
+        et.gravity = Gravity.TOP or Gravity.START
+        et.minLines = 6
+        et.inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_MULTI_LINE or InputType.TYPE_TEXT_VARIATION_URI
+        val c = clipText()
+        if (c.contains("http")) et.setText(c)
+        val box = LinearLayout(this)
+        box.setBackgroundColor(cCard)
+        box.setPadding(dp(18), dp(10), dp(18), dp(10))
+        box.addView(et, lp(MATCH, WRAP))
+        AlertDialog.Builder(this).setTitle("تحميل دفعة روابط").setView(box)
+            .setPositiveButton("بدء التحميل") { _, _ ->
+                val urls = Regex("https?://[^\\s\"'<>]+").findAll(et.text.toString()).map { it.value }.distinct().toList()
+                if (urls.isEmpty()) {
+                    toast("لم أجد روابط")
+                    return@setPositiveButton
+                }
+                for (u in urls) {
+                    val h = HashMap<String, String>()
+                    h["User-Agent"] = curUa
+                    h["Referer"] = cur?.web?.url ?: ""
+                    h["Cookie"] = CookieManager.getInstance().getCookie(u) ?: ""
+                    addFound(u, h, null, cur, "")
+                    foundStart[u]?.invoke()
+                }
+                showPage(1)
+                toast("أُضيف " + urls.size + " رابط")
+            }
+            .setNegativeButton("إلغاء", null).show()
+    }
+
+    // ---------- أحجام الأزرار والأيقونات ----------
+
+    private fun regStatic() {
+        sizeIds["bar_back"] = Pair("شريط المتصفح العلوي", "رجوع")
+        sizeIds["bar_fwd"] = Pair("شريط المتصفح العلوي", "تقدم")
+        sizeIds["bar_tabs"] = Pair("شريط المتصفح العلوي", "التبويبات")
+        sizeIds["bar_reload"] = Pair("شريط المتصفح العلوي", "تحديث")
+        sizeIds["txt_pill"] = Pair("الأزرار النصية", "تحميل، نسخ الرابط، إيقاف مؤقت، إلغاء وأمثالها")
+        val navs = listOf("المتصفح", "التحميلات", "الأدوات", "الإعدادات", "التنبيهات")
+        for (i in navs.indices) sizeIds["nav_" + i] = Pair("الشريط السفلي", navs[i])
+    }
+
+    private fun pctB(id: String): Int = prefs().getInt("szb_" + id, 100).coerceIn(30, 300)
+    private fun pctI(id: String): Int = prefs().getInt("szi_" + id, 100).coerceIn(30, 300)
+
+    private fun applyBarSizes() {
+        // الحد الأقصى لعرض كل زر كي يبقى مربع الرابط ظاهراً: 4 أزرار + 150dp للرابط والهوامش
+        val maxBox = (resources.displayMetrics.widthPixels - dp(150)) / 4
+        fun box(id: String): Int = minOf(dp(38 * pctB(id) / 100), maxBox).coerceAtLeast(dp(12))
+        fun ap(id: String, v: View, defI: Int) {
+            val b = box(id)
+            val ic = minOf(b, dp(defI * pctI(id) / 100))
+            val pad = (b - ic) / 2
+            v.setPadding(pad, pad, pad, pad)
+            val p = v.layoutParams
+            if (p != null) {
+                p.width = b
+                p.height = b
+                v.layoutParams = p
+            }
+        }
+        try {
+            ap("bar_back", barBack, 22)
+            ap("bar_fwd", barFwd, 22)
+            ap("bar_reload", reloadBtn, 22)
+            ap("bar_tabs", barTabs, 22)
+            val ic = minOf(box("bar_tabs"), dp(22 * pctI("bar_tabs") / 100))
+            val q = tabBtn.layoutParams
+            if (q != null) {
+                q.width = ic
+                q.height = ic
+                tabBtn.layoutParams = q
+            }
+        } catch (e: Throwable) {
+            logErr("واجهة", "تعذر تطبيق أحجام الشريط العلوي: " + (e.message ?: e.javaClass.simpleName), e)
+        }
+    }
+
+    // يعيد بناء الأدوات والشريط السفلي بالأحجام الجديدة
+    private fun applySizes() {
+        try {
+            applyBarSizes()
+            val oldT = pagesList[2]
+            val nt = buildTools()
+            pagesList[2] = nt
+            val ti = pageHost.indexOfChild(oldT)
+            pageHost.removeViewAt(ti)
+            pageHost.addView(nt, ti, FrameLayout.LayoutParams(MATCH, MATCH))
+            nt.visibility = oldT.visibility
+            root.removeViewAt(root.childCount - 1)
+            navItems.clear()
+            root.addView(buildNav(), lp(MATCH, WRAP))
+            showPage(page)
+            restylePills(root)
+        } catch (e: Throwable) {
+            logErr("واجهة", "تعذر تطبيق الأحجام: " + (e.message ?: ""), e)
+        }
+    }
+
+    private fun showSizes() {
+        val sv = ScrollView(this)
+        val col = LinearLayout(this)
+        col.orientation = LinearLayout.VERTICAL
+        col.setBackgroundColor(cCard)
+        col.setPadding(dp(16), dp(10), dp(16), dp(10))
+        sv.addView(col)
+        val groups = LinkedHashMap<String, ArrayList<String>>()
+        for ((id, gl) in sizeIds) groups.getOrPut(gl.first) { ArrayList() }.add(id)
+        fun fill() {
+            val keepY = sv.scrollY
+            col.removeAllViews()
+            col.addView(tv("اسحب الشريط للتحكم بالحجم من 30% إلى 300%. يُطبَّق فوراً. أزرار الشريط العلوي تتوقف عند أكبر حجم يُبقي مربع الرابط ظاهراً.", 12f, cMuted), lp(MATCH, WRAP, 0f, 0, 0, 0, 4))
+            labeledSeek(col, "عدد أعمدة بطاقات الأدوات", 2, 4, prefs().getInt("toolcols", 3).coerceIn(2, 4), { "" + it }) { v ->
+                prefs().edit().putInt("toolcols", v).apply()
+                applySizes()
+            }
+            for ((g, ids) in groups) {
+                col.addView(tv(g, 15f, cAccent, true), lp(MATCH, WRAP, 0f, 0, 18, 0, 2))
+                val first = ids[0]
+                if (ids.size > 1) {
+                    labeledSeek(col, "كل أزرار المجموعة", 30, 300, pctB(first), { "$it%" }) { v ->
+                        val e = prefs().edit()
+                        for (id in ids) e.putInt("szb_" + id, v)
+                        e.apply()
+                        applySizes()
+                        fill()
+                    }
+                    labeledSeek(col, "كل أيقونات المجموعة", 30, 300, pctI(first), { "$it%" }) { v ->
+                        val e = prefs().edit()
+                        for (id in ids) e.putInt("szi_" + id, v)
+                        e.apply()
+                        applySizes()
+                        fill()
+                    }
+                }
+                for (id in ids) {
+                    val label = sizeIds[id]?.second ?: id
+                    col.addView(tv("▪ " + label, 13f, cText, true), lp(MATCH, WRAP, 0f, 0, 12, 0, 0))
+                    labeledSeek(col, "الزر", 30, 300, pctB(id), { "$it%" }) { v ->
+                        prefs().edit().putInt("szb_" + id, v).apply()
+                        applySizes()
+                    }
+                    if (id !in noIconIds) {
+                        labeledSeek(col, "الأيقونة", 30, 300, pctI(id), { "$it%" }) { v ->
+                            prefs().edit().putInt("szi_" + id, v).apply()
+                            applySizes()
+                        }
+                    }
+                }
+            }
+            sv.post { sv.scrollTo(0, keepY) }
+        }
+        fill()
+        AlertDialog.Builder(this).setTitle("أحجام الأزرار والأيقونات").setView(sv)
+            .setPositiveButton("تم", null)
+            .setNeutralButton("إعادة الضبط") { _, _ ->
+                val e = prefs().edit()
+                for (k in prefs().all.keys) if (k.startsWith("szb_") || k.startsWith("szi_") || k == "toolcols") e.remove(k)
+                e.apply()
+                applySizes()
+                toast("أُعيدت الأحجام الأصلية")
+            }.show()
     }
 }
