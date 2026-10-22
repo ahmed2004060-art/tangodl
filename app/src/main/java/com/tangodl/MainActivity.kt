@@ -283,7 +283,7 @@ class MainActivity : Activity() {
     }
 
     private fun enqueue(u: String, h: Map<String, String>, bar: ProgressBar, msg: TextView, btn: Button) {
-        val progress = { done: Int, total: Int ->
+        val progress: (Int, Int) -> Unit = { done, total ->
             ui.post {
                 bar.max = if (total > 0) total else 100
                 bar.progress = done
@@ -322,7 +322,7 @@ class MainActivity : Activity() {
 
     // ---------- الشبكة ----------
 
-    private fun open(u: String, h: Map<String, String>): HttpURLConnection {
+    private fun conn(u: String, h: Map<String, String>): HttpURLConnection {
         val c = URL(u).openConnection() as HttpURLConnection
         c.connectTimeout = 15000
         c.readTimeout = 30000
@@ -333,15 +333,15 @@ class MainActivity : Activity() {
     }
 
     private fun text(u: String, h: Map<String, String>): String =
-        open(u, h).inputStream.bufferedReader().use { it.readText() }
+        conn(u, h).inputStream.bufferedReader().use { it.readText() }
 
     private fun bytes(u: String, h: Map<String, String>): ByteArray =
-        open(u, h).inputStream.use { it.readBytes() }
+        conn(u, h).inputStream.use { it.readBytes() }
 
-    private fun abs(base: String, ref: String): String = URL(URL(base), ref).toString()
+    private fun absUrl(base: String, ref: String): String = URL(URL(base), ref).toString()
 
     private fun direct(u: String, h: Map<String, String>, out: File, progress: (Int, Int) -> Unit) {
-        val c = open(u, h)
+        val c = conn(u, h)
         val total = c.contentLength
         var done = 0L
         c.inputStream.use { i ->
@@ -376,7 +376,7 @@ class MainActivity : Activity() {
                     }
                 }
             }
-            url = abs(url, best.trim())
+            url = absUrl(url, best.trim())
             pl = text(url, h)
         }
 
@@ -386,10 +386,10 @@ class MainActivity : Activity() {
         for (l in pl.lines()) {
             if (l.startsWith("#EXT-X-KEY") && l.contains("AES-128")) {
                 val ku = Regex("URI=\"([^\"]+)\"").find(l)!!.groupValues[1]
-                keyBytes = bytes(abs(url, ku), h)
+                keyBytes = bytes(absUrl(url, ku), h)
                 ivHex = Regex("IV=0x([0-9A-Fa-f]+)").find(l)?.groupValues?.get(1)
             } else if (l.isNotBlank() && !l.startsWith("#")) {
-                segs.add(abs(url, l.trim()))
+                segs.add(absUrl(url, l.trim()))
             }
         }
         if (segs.isEmpty()) throw Exception("القائمة فاضية")
