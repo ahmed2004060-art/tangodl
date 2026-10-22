@@ -124,6 +124,9 @@ class MainActivity : Activity() {
     private val alerts = ArrayList<AlertItem>()
     private lateinit var alertList: LinearLayout
     private lateinit var alertEmpty: TextView
+    private lateinit var tabBtn: TextView
+    private lateinit var activeBox: LinearLayout
+    private lateinit var activeTitle: TextView
 
     // بدء تحميل كل رابط ملتقط وهيدرزه (لأزرار الفيديو داخل الصفحة)
     private val foundStart = HashMap<String, () -> Unit>()
@@ -134,14 +137,37 @@ class MainActivity : Activity() {
     private class Ctl {
         @Volatile var cancelled = false
         @Volatile var paused = false
+        val bytes = java.util.concurrent.atomic.AtomicLong(0)
     }
     private class CancelledException : Exception("أُلغي التحميل")
-    private class Row(val bar: ProgressBar, val msg: TextView, val btn: View, val pause: TextView, val cancel: TextView, val ctl: Ctl)
+    private class Row(val bar: ProgressBar, val msg: TextView, val btn: View, val pause: TextView, val cancel: TextView, val ctl: Ctl, val view: View)
 
     // يوقف الخيط أثناء الإيقاف المؤقت ويرمي استثناء عند الإلغاء
     private fun gate(c: Ctl) {
         while (c.paused && !c.cancelled) Thread.sleep(200)
         if (c.cancelled) throw CancelledException()
+    }
+
+    private fun fmtSize(b: Double): String = when {
+        b >= 1048576.0 -> String.format(java.util.Locale.US, "%.1f MB", b / 1048576.0)
+        b >= 1024.0 -> String.format(java.util.Locale.US, "%.0f KB", b / 1024.0)
+        else -> b.toLong().toString() + " B"
+    }
+
+    private fun fmtTime(sec: Long): String {
+        val m = sec / 60
+        val x = sec % 60
+        return if (m >= 60) String.format(java.util.Locale.US, "%d:%02d:%02d", m / 60, m % 60, x)
+        else String.format(java.util.Locale.US, "%02d:%02d", m, x)
+    }
+
+    // ينقل صف التحميل إلى قسم "جارٍ التحميل" أثناء النزول ثم يعيده للقائمة
+    private fun setActive(r: Row, on: Boolean) {
+        (r.view.parent as? ViewGroup)?.removeView(r.view)
+        if (on) activeBox.addView(r.view, 0, lp(MATCH, WRAP, 0f, 0, 0, 0, 10))
+        else list.addView(r.view, 0, lp(MATCH, WRAP, 0f, 0, 0, 0, 10))
+        activeTitle.visibility = if (activeBox.childCount > 0) View.VISIBLE else View.GONE
+        updateCounts()
     }
 
     private fun saver() = prefs().getBoolean("saver", false)
@@ -166,6 +192,7 @@ class MainActivity : Activity() {
         var loading = false
         var title = ""
         var restoring = false
+        var injected = false
     }
 
     // ---------- أدوات مساعدة للواجهة ----------
@@ -425,6 +452,13 @@ class MainActivity : Activity() {
         }
         bar.addView(urlBox, lp(0, dp(40), 1f, 4, 0, 4, 0))
 
+        // زر التبويبات بجانب الرابط (يعرض العدد ويفتح قائمة التبويبات)
+        tabBtn = tv("1", 14f, cText, true)
+        tabBtn.gravity = Gravity.CENTER
+        tabBtn.background = bg(cBar, 10, cText)
+        tabBtn.setOnClickListener { showTabs() }
+        bar.addView(tabBtn, lp(dp(32), dp(32), 0f, 0, 0, 4, 0))
+
         pct = tv("", 11f, cAccent, true)
         pct.visibility = View.GONE
         bar.addView(pct, lp(WRAP, WRAP, 0f, 0, 0, 2, 0))
@@ -466,7 +500,7 @@ class MainActivity : Activity() {
         plusChip.setOnClickListener { newTab(prefs().getString("home", HOME) ?: HOME) }
         tabsRow.addView(plusChip, lp(WRAP, WRAP, 0f, 3, 3, 3, 3))
         tabsScroll.addView(tabsRow)
-        col.addView(tabsScroll, lp(MATCH, WRAP))
+        // شريط التبويبات القديم لم يعد يُعرض؛ التبويبات من الزر بجانب الرابط
 
         // منطقة الصفحة: تملأ كل المساحة المتبقية
         container = FrameLayout(this)
@@ -496,6 +530,12 @@ class MainActivity : Activity() {
         head.addView(pill("مسح القائمة", false) { clearFound() })
         col.addView(head, lp(MATCH, WRAP, 0f, 0, 0, 0, 6))
         col.addView(tv("شغّل الفيديو داخل المتصفح وستظهر روابطه هنا ثم اضغط تحميل. الملفات تُحفظ في مجلد التحميلات.", 12f, cMuted), lp(MATCH, WRAP, 0f, 0, 0, 0, 12))
+        activeTitle = tv("جارٍ التحميل الآن", 15f, cAccent, true)
+        activeTitle.visibility = View.GONE
+        col.addView(activeTitle, lp(MATCH, WRAP, 0f, 0, 0, 0, 6))
+        activeBox = LinearLayout(this)
+        activeBox.orientation = LinearLayout.VERTICAL
+        col.addView(activeBox, lp(MATCH, WRAP))
         emptyTv = tv("لا توجد روابط ملتقطة بعد", 14f, cMuted)
         emptyTv.gravity = Gravity.CENTER
         emptyTv.setPadding(0, dp(40), 0, dp(40))
@@ -809,6 +849,10 @@ class MainActivity : Activity() {
             override fun onProgressChanged(v: WebView, p: Int) {
                 val t = hasTab(v) ?: return
                 t.progress = p
+                if (p >= 20 && !t.injected) {
+                    t.injected = true
+                    if (prefs().getBoolean("overlay", true)) v.evaluateJavascript(OVERLAY_JS, null)
+                }
                 if (cur === t) updateLoadUi()
             }
 
@@ -859,6 +903,7 @@ class MainActivity : Activity() {
                 pages[v] = url
                 val t = hasTab(v) ?: return
                 t.loading = true
+                t.injected = false
                 t.progress = 5
                 if (cur === t) {
                     urlBox.setText(url)
@@ -976,6 +1021,28 @@ class MainActivity : Activity() {
         if (wasCur) switchTo(tabs[if (i > 0) i - 1 else 0])
     }
 
+    private fun showTabs() {
+        val items = Array(tabs.size) { i ->
+            val t = tabs[i]
+            (if (t === cur) "● " else "○ ") + (if (t.title.isNotBlank()) t.title else (t.web.url ?: ("تبويب " + (i + 1)))).take(50)
+        }
+        val dlg = AlertDialog.Builder(this)
+            .setTitle("التبويبات (" + tabs.size + ")")
+            .setItems(items) { _, i ->
+                switchTo(tabs[i])
+                showPage(0)
+            }
+            .setPositiveButton("تبويب جديد") { _, _ -> newTab(prefs().getString("home", HOME) ?: HOME) }
+            .setNeutralButton("إغلاق الحالي") { _, _ -> cur?.let { closeTab(it) } }
+            .setNegativeButton("رجوع", null)
+            .show()
+        dlg.listView.setOnItemLongClickListener { _, _, i, _ ->
+            if (i in tabs.indices) closeTab(tabs[i])
+            dlg.dismiss()
+            true
+        }
+    }
+
     private fun closeOthers() {
         val keep = cur ?: return
         for (t in ArrayList(tabs)) if (t !== keep) removeTab(t)
@@ -985,6 +1052,7 @@ class MainActivity : Activity() {
     }
 
     private fun relabel() {
+        tabBtn.text = "" + tabs.size
         for (i in tabs.indices) {
             val t = tabs[i]
             t.label.text = if (t.title.isNotBlank()) t.title else "تبويب " + (i + 1)
@@ -1527,6 +1595,9 @@ function srcOf(v){
   if(!s){var so=v.querySelector('source');if(so){s=so.src||'';}}
   return s;
 }
+function imgSrc(el){
+  return el.currentSrc||el.src||el.getAttribute('data-src')||el.getAttribute('data-original')||'';
+}
 function fmt(t){
   if(!isFinite(t)){return '0:00';}
   t=Math.floor(t);
@@ -1535,25 +1606,24 @@ function fmt(t){
 }
 function setup(el){
   var isV=el.tagName==='VIDEO';
-  var st={box:null,stalled:false,wt:null,drag:false,errSent:false};
+  var st={box:null,isV:isV,ok:false,stalled:false,wt:null,drag:false,errSent:false,sl:null,tm:null,rt:null,lastTxt:''};
   var box=document.createElement('div');
   box.className='__tdl';
-  box.setAttribute('style','position:absolute;z-index:2147483647;display:none;flex-direction:column;align-items:flex-start;pointer-events:none;direction:ltr;');
+  box.setAttribute('style','position:fixed;left:0;top:0;z-index:2147483647;display:none;flex-direction:column;align-items:flex-start;pointer-events:none;direction:ltr;will-change:transform;');
   var row=document.createElement('div');
   row.setAttribute('style','display:flex;pointer-events:auto;');
   var dl=mk('\u2B07',function(){
     if(!has()){return;}
     if(isV){TDL.video(srcOf(el),location.href);}
-    else{TDL.image(el.currentSrc||el.src||'',location.href,'dl');}
+    else{TDL.image(imgSrc(el),location.href,'dl');}
   });
   var cp=mk('\uD83D\uDD17',function(){
     if(!has()){return;}
     if(isV){TDL.copyVideo(srcOf(el));}
-    else{TDL.image(el.currentSrc||el.src||'',location.href,'copy');}
+    else{TDL.image(imgSrc(el),location.href,'copy');}
   });
   row.appendChild(dl);
   row.appendChild(cp);
-  st.sl=null;st.tm=null;st.rt=null;
   if(isV){
     var rt=mk('\u27F3',function(){
       var t=el.currentTime;
@@ -1613,38 +1683,43 @@ function setup(el){
   st.box=box;
   map.set(el,st);
 }
-function place(el,st){
-  var r=el.getBoundingClientRect();
-  var isV=el.tagName==='VIDEO';
-  var okSize=isV?(r.width>=120&&r.height>=80):(r.width>=120&&r.height>=120);
-  var cs=window.getComputedStyle(el);
-  if(!okSize||cs.display==='none'||cs.visibility==='hidden'){st.box.style.display='none';return;}
-  st.box.style.display='flex';
-  st.box.style.left=(r.left+window.scrollX+4)+'px';
-  st.box.style.top=(r.top+window.scrollY+4)+'px';
-  if(isV){
-    var d=el.duration;
-    var ok=isFinite(d)&&d>0;
-    st.sl.style.display=ok?'block':'none';
-    st.tm.style.display=ok?'block':'none';
-    if(ok){
-      st.sl.style.width=Math.max(80,Math.min(r.width-12,240))+'px';
-      if(!st.drag){st.sl.value=Math.round(el.currentTime/d*1000);}
-      st.tm.textContent=fmt(el.currentTime)+' / '+fmt(d);
+// خفيف: يُستدعى أثناء التمرير وكل 300 مللي ثانية، يحرّك الأزرار مع العنصر
+function upd(){
+  var vw=window.innerWidth,vh=window.innerHeight;
+  map.forEach(function(st,el){
+    if(!st.ok){if(st.box.style.display!=='none'){st.box.style.display='none';}return;}
+    var r=el.getBoundingClientRect();
+    if(r.width<1||r.bottom<0||r.top>vh||r.right<0||r.left>vw){
+      if(st.box.style.display!=='none'){st.box.style.display='none';}
+      return;
     }
-    st.rt.style.display=(st.stalled||el.error)?'block':'none';
-  }
+    if(st.box.style.display!=='flex'){st.box.style.display='flex';}
+    var x=Math.max(r.left,0)+4,y=Math.max(r.top,0)+4;
+    st.box.style.transform='translate('+x+'px,'+y+'px)';
+    if(st.isV){
+      var d=el.duration;
+      var ok=isFinite(d)&&d>0;
+      var dsp=ok?'block':'none';
+      if(st.sl.style.display!==dsp){st.sl.style.display=dsp;st.tm.style.display=dsp;}
+      if(ok){
+        st.sl.style.width=Math.max(80,Math.min(r.width-12,240))+'px';
+        if(!st.drag){st.sl.value=Math.round(el.currentTime/d*1000);}
+        var tx=fmt(el.currentTime)+' / '+fmt(d);
+        if(tx!==st.lastTxt){st.lastTxt=tx;st.tm.textContent=tx;}
+      }
+      var rs=(st.stalled||el.error)?'block':'none';
+      if(st.rt.style.display!==rs){st.rt.style.display=rs;}
+    }
+  });
 }
 function scan(){
   var list=document.querySelectorAll('video,img');
   for(var i=0;i<list.length;i++){
     var el=list[i];
     if(!map.has(el)&&map.size<MAXN){
+      var r=el.getBoundingClientRect();
       if(el.tagName==='VIDEO'){setup(el);}
-      else{
-        var r=el.getBoundingClientRect();
-        if(r.width>=120&&r.height>=120){setup(el);}
-      }
+      else if(r.width>=100&&r.height>=100){setup(el);}
     }
   }
   map.forEach(function(st,el){
@@ -1652,11 +1727,25 @@ function scan(){
       if(st.box&&st.box.parentNode){st.box.parentNode.removeChild(st.box);}
       map.delete(el);
     }else{
-      place(el,st);
+      var r2=el.getBoundingClientRect();
+      var cs=window.getComputedStyle(el);
+      var big=st.isV?(r2.width>=80&&r2.height>=60):(r2.width>=100&&r2.height>=100);
+      st.ok=big&&cs.display!=='none'&&cs.visibility!=='hidden';
     }
   });
+  upd();
 }
-setInterval(scan,700);
+var tick=false;
+function sched(){
+  if(tick){return;}
+  tick=true;
+  requestAnimationFrame(function(){tick=false;upd();});
+}
+window.addEventListener('scroll',sched,{capture:true,passive:true});
+window.addEventListener('touchmove',sched,{capture:true,passive:true});
+window.addEventListener('resize',sched,false);
+setInterval(upd,300);
+setInterval(scan,1500);
 scan();
 })();
 """
@@ -1667,7 +1756,8 @@ scan();
         val n = found.size
         badge.visibility = if (n > 0 && page == 0) View.VISIBLE else View.GONE
         badge.text = "تحميل ($n)"
-        navItems[1].second.text = if (n > 0) "التحميلات ($n)" else "التحميلات"
+        val act = activeBox.childCount
+        navItems[1].second.text = if (act > 0) "جارٍ ($act)" else if (n > 0) "التحميلات ($n)" else "التحميلات"
         emptyTv.visibility = if (n > 0) View.GONE else View.VISIBLE
         if (navItems.size > 4) navItems[4].second.text = if (alerts.isNotEmpty()) "التنبيهات (" + alerts.size + ")" else "التنبيهات"
         alertEmpty.visibility = if (alerts.isNotEmpty()) View.GONE else View.VISIBLE
@@ -1730,7 +1820,7 @@ scan();
             ctl.cancelled = true
             msg.text = "جاري الإلغاء..."
         }
-        val rw = Row(bar, msg, btn, pauseB, cancelB, ctl)
+        val rw = Row(bar, msg, btn, pauseB, cancelB, ctl, row)
         val go: () -> Unit = {
             if (!btn.isEnabled) toast("قيد التحميل أو تم تحميله")
             else startDl(u, h, rw)
@@ -1749,7 +1839,7 @@ scan();
         row.addView(title)
         row.addView(host)
         row.addView(btns, lp(MATCH, WRAP, 0f, 0, 8, 0, 0))
-        row.addView(bar, lp(MATCH, dp(4), 0f, 0, 8, 0, 0))
+        row.addView(bar, lp(MATCH, dp(8), 0f, 0, 8, 0, 0))
         row.addView(msg, lp(MATCH, WRAP, 0f, 0, 4, 0, 0))
         list.addView(row, 0, lp(MATCH, WRAP, 0f, 0, 0, 0, 10))
         updateCounts()
@@ -1762,11 +1852,40 @@ scan();
         r.pause.text = "إيقاف مؤقت"
         r.pause.visibility = View.VISIBLE
         r.cancel.visibility = View.VISIBLE
+        ctl.bytes.set(0)
+        setActive(r, true)
+        val t0 = System.currentTimeMillis()
+        var lastT = t0
+        var lastB = 0L
+        var speed = 0.0
         val progress: (Int, Int) -> Unit = { done, total ->
             ui.post {
                 r.bar.max = if (total > 0) total else 100
                 r.bar.progress = done
-                if (!ctl.paused && !ctl.cancelled) r.msg.text = if (total > 0) "$done / $total" else "جاري التحميل..."
+                if (!ctl.paused && !ctl.cancelled) {
+                    val now = System.currentTimeMillis()
+                    val b = ctl.bytes.get()
+                    if (now - lastT >= 800) {
+                        val inst = (b - lastB) * 1000.0 / (now - lastT)
+                        speed = if (speed == 0.0) inst else speed * 0.6 + inst * 0.4
+                        lastT = now
+                        lastB = b
+                    }
+                    val frac = if (total > 0) done.toDouble() / total else 0.0
+                    val el = (now - t0) / 1000
+                    val pc = (frac * 100).toInt()
+                    val sb = StringBuilder()
+                    if (total > 0) sb.append(pc).append("%  •  ")
+                    sb.append(fmtSize(b.toDouble()))
+                    if (speed > 0) sb.append("  •  ").append(fmtSize(speed)).append("/ث")
+                    sb.append("\n").append("مضى ").append(fmtTime(el))
+                    if (frac > 0.02) sb.append("  •  متبقي ").append(fmtTime((el * (1 - frac) / frac).toLong()))
+                    r.msg.text = sb.toString()
+                    if (page == 0) {
+                        badge.visibility = View.VISIBLE
+                        badge.text = "⬇ " + pc + "%"
+                    }
+                }
             }
         }
         queue.execute {
@@ -1809,6 +1928,7 @@ scan();
                 ui.post {
                     r.pause.visibility = View.GONE
                     r.cancel.visibility = View.GONE
+                    setActive(r, false)
                 }
             }
         }
@@ -1867,8 +1987,8 @@ scan();
         var u = u0
         for (hop in 0..5) {
             val c = URL(u).openConnection() as HttpURLConnection
-            c.connectTimeout = 15000
-            c.readTimeout = 30000
+            c.connectTimeout = 30000
+            c.readTimeout = 60000
             c.instanceFollowRedirects = false
             for ((k, v) in h) {
                 if (v.isNotEmpty() && k.lowercase() !in skipHeaders) c.setRequestProperty(k, v)
@@ -1933,6 +2053,7 @@ scan();
                         if (n < 0) break
                         o.write(buf, 0, n)
                         done += n
+                        ctl.bytes.addAndGet(n.toLong())
                         if (tl > 0) progress((done * 100 / tl).toInt(), 100) else progress(0, 0)
                     }
                 }
@@ -1971,6 +2092,7 @@ scan();
                                         if (m < 0) break
                                         o.write(buf, 0, m)
                                         val g = got.addAndGet(m.toLong())
+                                        ctl.bytes.addAndGet(m.toLong())
                                         progress((g * 100 / total).toInt(), 100)
                                     }
                                 }
@@ -2092,7 +2214,8 @@ scan();
                     val part = parts[s.index]
                     // جزء مكتمل من محاولة سابقة: لا يُعاد تحميله
                     if (!(part.exists() && part.length() > 0)) {
-                        var d = retry(3) { gate(ctl); bytes(s.url, h) }
+                        var d = retry(5) { gate(ctl); bytes(s.url, h) }
+                        ctl.bytes.addAndGet(d.size.toLong())
                         if (s.key != null) {
                             val c = Cipher.getInstance("AES/CBC/PKCS5Padding")
                             c.init(Cipher.DECRYPT_MODE, SecretKeySpec(s.key, "AES"), IvParameterSpec(s.iv))
