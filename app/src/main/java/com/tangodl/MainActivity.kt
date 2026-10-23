@@ -139,7 +139,6 @@ class MainActivity : Activity() {
     private lateinit var loadBar: ProgressBar
     private lateinit var pct: TextView
     private lateinit var reloadBtn: ImageView
-    private lateinit var badge: TextView
     private lateinit var list: LinearLayout
     private lateinit var emptyTv: TextView
     private lateinit var manualBox: EditText
@@ -152,7 +151,13 @@ class MainActivity : Activity() {
     private lateinit var tabBtn: TextView
     private lateinit var activeBox: LinearLayout
     private lateinit var activeTitle: TextView
-    private lateinit var activeEmpty: TextView
+    private lateinit var badge: TextView
+    private lateinit var dlFab: TextView
+    private lateinit var dlActions: LinearLayout
+    private lateinit var listTitle: TextView
+    private lateinit var dlScroll: ScrollView
+    private var dlFilter = 0
+    private val dlChips = ArrayList<TextView>()
 
     // بدء تحميل كل رابط ملتقط وهيدرزه (لأزرار الفيديو داخل الصفحة)
     private val foundStart = HashMap<String, () -> Unit>()
@@ -277,7 +282,6 @@ class MainActivity : Activity() {
     }
     private val subUrls = HashSet<String>()
     private val analyzer = java.util.concurrent.ThreadPoolExecutor(16, 16, 30L, java.util.concurrent.TimeUnit.SECONDS, java.util.concurrent.LinkedBlockingQueue<Runnable>()).also { it.allowCoreThreadTimeOut(true) }
-    private lateinit var dlFab: TextView
     private lateinit var startView: ScrollView
     private lateinit var startSites: LinearLayout
     private lateinit var startBm: LinearLayout
@@ -297,6 +301,10 @@ class MainActivity : Activity() {
         var finalLoc: String? = null
         var finalIsUri = false
         var watch: View? = null
+        // 0 ملتقط، 1 جارٍ، 2 متوقف مؤقتاً، 3 مكتمل، 4 غير مكتمل (أُلغي أو فشل)
+        var state = 0
+        var removed = false
+        var chip: TextView? = null
     }
 
     // يوقف الخيط أثناء الإيقاف المؤقت ويرمي استثناء عند الإلغاء
@@ -321,6 +329,10 @@ class MainActivity : Activity() {
     // ينقل صف التحميل إلى قسم "جارٍ التحميل" أثناء النزول ثم يعيده للقائمة
     private fun setActive(r: Row, on: Boolean) {
         (r.view.parent as? ViewGroup)?.removeView(r.view)
+        if (r.removed) {
+            updateCounts()
+            return
+        }
         if (on) activeBox.addView(r.view, 0, lp(MATCH, WRAP, 0f, 0, 0, 0, 10))
         else list.addView(r.view, 0, lp(MATCH, WRAP, 0f, 0, 0, 0, 10))
         updateCounts()
@@ -361,6 +373,8 @@ class MainActivity : Activity() {
         var injected = false
         var lastUrl = ""
         var start = false
+        var startBack = false
+        var popup = false
         var scanning = false
     }
 
@@ -528,8 +542,20 @@ class MainActivity : Activity() {
         val saved = b?.getStringArrayList("urls")
         if (saved != null && saved.isNotEmpty()) {
             for (u in saved) newTab(u)
+            // استعادة حالة واجهة البدء لكل تبويب (مثلاً تبويب فُتحت فوقه واجهة التطبيق)
+            val st = b?.getBooleanArray("starts")
+            val sb = b?.getBooleanArray("startbacks")
+            for (i in tabs.indices) {
+                if (st != null && i < st.size) tabs[i].start = st[i]
+                if (sb != null && i < sb.size) tabs[i].startBack = sb[i]
+            }
             val ci = b?.getInt("cur", 0) ?: 0
             if (ci in tabs.indices) switchTo(tabs[ci])
+            // العودة لنفس الصفحة التي كان المستخدم فيها (إعدادات/تحميلات/أدوات) بدل المتصفح
+            val pg = b?.getInt("page", 0) ?: 0
+            if (pg in pagesList.indices) showPage(pg)
+            val ss = b?.getString("setsub") ?: ""
+            if (ss.isNotEmpty()) openSettingsSub(ss)
         } else {
             newHomeTab()
         }
@@ -541,6 +567,10 @@ class MainActivity : Activity() {
         for (t in tabs) urls.add(t.web.url ?: "")
         out.putStringArrayList("urls", urls)
         out.putInt("cur", tabs.indexOf(cur))
+        out.putInt("page", page)
+        out.putString("setsub", setSub)
+        out.putBooleanArray("starts", BooleanArray(tabs.size) { tabs[it].start })
+        out.putBooleanArray("startbacks", BooleanArray(tabs.size) { tabs[it].startBack })
     }
 
     override fun onPause() {
@@ -572,9 +602,44 @@ class MainActivity : Activity() {
         super.onDestroy()
     }
 
+    private var lastBackAt = 0L
+
+    // الرجوع داخل التبويب: صفحة سابقة، ثم إغلاق تبويب منبثق، ثم واجهة التطبيق. يعيد false إذا لم يبقَ شيء للرجوع إليه
+    private fun backInTab(t: Tab): Boolean {
+        if (t.start) {
+            // الواجهة ظاهرة: إن فتحناها من زر «الرئيسية» نعود للصفحة التي كانت خلفها
+            if (t.startBack && t.web.url != null) {
+                t.start = false
+                t.startBack = false
+                updateStart()
+                return true
+            }
+            return false
+        }
+        if (t.web.canGoBack()) {
+            t.web.goBack()
+            return true
+        }
+        // تبويب فتحته صفحة أخرى: نغلقه ونعود لما قبله
+        if (t.popup && tabs.size > 1) {
+            closeTab(t)
+            return true
+        }
+        // لا توجد صفحة سابقة: نعرض واجهة التطبيق بدل الخروج
+        t.start = true
+        t.startBack = false
+        hideKb()
+        updateStart()
+        return true
+    }
+
     override fun onBackPressed() {
         if (fullView != null) {
             hideFull()
+            return
+        }
+        if (page == 3 && setSub.isNotEmpty()) {
+            openSettingsSub("")
             return
         }
         if (page != 0) {
@@ -586,12 +651,15 @@ class MainActivity : Activity() {
             return
         }
         val t = cur
-        if (t != null && t.start && t.web.url != null) {
-            t.start = false
-            updateStart()
-            return
+        if (t != null && backInTab(t)) return
+        // نحن في واجهة التطبيق: ضغطتان للخروج حتى لا يخرج التطبيق بالخطأ
+        val now = System.currentTimeMillis()
+        if (now - lastBackAt < 2000) {
+            super.onBackPressed()
+        } else {
+            lastBackAt = now
+            toast("اضغط رجوع مرة أخرى للخروج")
         }
-        if (t != null && t.web.canGoBack()) t.web.goBack() else super.onBackPressed()
     }
 
     // ---------- البناء: الشريط السفلي والصفحات ----------
@@ -627,7 +695,7 @@ class MainActivity : Activity() {
             val isz = minOf(dp(24 * pi / 100), resources.displayMetrics.widthPixels / 5 - dp(4))
             item.addView(im, lp(isz, isz))
             item.addView(t, lp(WRAP, WRAP, 0f, 0, 2, 0, 0))
-            item.setOnClickListener { showPage(idx) }
+            item.setOnClickListener { if (idx == 3 && page == 3 && setSub.isNotEmpty()) openSettingsSub("") else showPage(idx) }
             row.addView(item, lp(0, WRAP, 1f))
             navItems.add(Pair(im, t))
         }
@@ -658,7 +726,7 @@ class MainActivity : Activity() {
         bar.gravity = Gravity.CENTER_VERTICAL
         bar.setBackgroundColor(cBar)
         bar.setPadding(dp(6), dp(6), dp(6), dp(6))
-        barBack = iconBtn(R.drawable.ic_back) { cur?.web?.let { if (it.canGoBack()) it.goBack() } }
+        barBack = iconBtn(R.drawable.ic_back) { cur?.let { backInTab(it) } }
         bar.addView(barBack, lp(dp(38), dp(38)))
         barFwd = iconBtn(R.drawable.ic_forward) { cur?.web?.let { if (it.canGoForward()) it.goForward() } }
         bar.addView(barFwd, lp(dp(38), dp(38)))
@@ -761,25 +829,6 @@ class MainActivity : Activity() {
 
         frame.addView(col, FrameLayout.LayoutParams(MATCH, MATCH))
 
-        badge = tv("", 13f, Color.WHITE, true)
-        badge.background = bg(cAccent, 22)
-        badge.setPadding(dp(16), dp(10), dp(16), dp(10))
-        badge.visibility = View.GONE
-        badge.setOnClickListener { showPage(1) }
-        val bp = FrameLayout.LayoutParams(WRAP, WRAP, Gravity.BOTTOM or Gravity.END)
-        bp.setMargins(dp(14), dp(14), dp(14), dp(14))
-        frame.addView(badge, bp)
-
-        // زر تحميل الفيديو الظاهر: يظهر عندما يلتقط التطبيق فيديو مسجلاً في التبويب الحالي
-        dlFab = tv("⬇ تحميل الفيديو", 14f, Color.WHITE, true)
-        dlFab.background = bg(cAccent, 24)
-        dlFab.setPadding(dp(18), dp(12), dp(18), dp(12))
-        dlFab.elevation = dp(6).toFloat()
-        dlFab.visibility = View.GONE
-        dlFab.setOnClickListener { onFabClick() }
-        val fp = FrameLayout.LayoutParams(WRAP, WRAP, Gravity.BOTTOM or Gravity.END)
-        fp.setMargins(dp(14), dp(14), dp(14), dp(70))
-        frame.addView(dlFab, fp)
         applyBarSizes()
         return frame
     }
@@ -795,16 +844,59 @@ class MainActivity : Activity() {
         head.addView(pill("المخزن", true) { openStorage() }, lp(WRAP, WRAP, 0f, 0, 0, 6, 0))
         head.addView(pill("مسح القائمة", false) { clearFound() })
         col.addView(head, lp(MATCH, WRAP, 0f, 0, 0, 0, 6))
-        col.addView(tv("شغّل الفيديو داخل المتصفح وستظهر روابطه هنا ثم اضغط تحميل. الملفات تُحفظ في مجلد التحميلات.", 12f, cMuted), lp(MATCH, WRAP, 0f, 0, 0, 0, 12))
+        col.addView(tv("شغّل الفيديو داخل المتصفح وستظهر روابطه هنا ثم اضغط تحميل. الملفات تُحفظ في مجلد التحميلات.", 12f, cMuted), lp(MATCH, WRAP, 0f, 0, 0, 0, 10))
+
+        // الأيقونتان الزرقاوان: عدّاد الروابط وتحميل فيديو التبويب الحالي
+        dlActions = LinearLayout(this)
+        dlActions.orientation = LinearLayout.HORIZONTAL
+        badge = tv("", 13f, Color.WHITE, true)
+        badge.gravity = Gravity.CENTER
+        badge.background = bg(cAccent, 22)
+        badge.setPadding(dp(16), dp(10), dp(16), dp(10))
+        badge.visibility = View.GONE
+        badge.setOnClickListener {
+            dlFilter = if (activeBox.childCount > 0) 1 else 0
+            updateCounts()
+            dlScroll.smoothScrollTo(0, 0)
+        }
+        dlActions.addView(badge, lp(0, WRAP, 1f, 0, 0, 6, 0))
+        dlFab = tv("⬇ تحميل الفيديو", 14f, Color.WHITE, true)
+        dlFab.gravity = Gravity.CENTER
+        dlFab.background = bg(cAccent, 24)
+        dlFab.setPadding(dp(18), dp(12), dp(18), dp(12))
+        dlFab.visibility = View.GONE
+        dlFab.setOnClickListener { onFabClick() }
+        dlActions.addView(dlFab, lp(0, WRAP, 1f))
+        dlActions.visibility = View.GONE
+        col.addView(dlActions, lp(MATCH, WRAP, 0f, 0, 0, 0, 10))
+
+        // فلاتر التنظيم
+        val chipsScroll = HorizontalScrollView(this)
+        chipsScroll.isHorizontalScrollBarEnabled = false
+        val chipsRow = LinearLayout(this)
+        chipsRow.orientation = LinearLayout.HORIZONTAL
+        dlChips.clear()
+        for (i in 0 until 5) {
+            val c = tv("", 12f, cAccent, true)
+            c.gravity = Gravity.CENTER
+            c.setPadding(dp(14), dp(7), dp(14), dp(7))
+            c.setOnClickListener {
+                dlFilter = i
+                updateCounts()
+            }
+            dlChips.add(c)
+            chipsRow.addView(c, lp(WRAP, WRAP, 0f, 0, 0, 6, 0))
+        }
+        chipsScroll.addView(chipsRow)
+        col.addView(chipsScroll, lp(MATCH, WRAP, 0f, 0, 0, 0, 12))
+
         activeTitle = tv("جارٍ التحميل الآن", 16f, cAccent, true)
         col.addView(activeTitle, lp(MATCH, WRAP, 0f, 0, 0, 0, 6))
         activeBox = LinearLayout(this)
         activeBox.orientation = LinearLayout.VERTICAL
         col.addView(activeBox, lp(MATCH, WRAP))
-        activeEmpty = tv("لا توجد تحميلات جارية الآن", 13f, cMuted)
-        activeEmpty.setPadding(0, dp(4), 0, dp(14))
-        col.addView(activeEmpty, lp(MATCH, WRAP))
-        col.addView(tv("الفيديوهات الملتقطة", 15f, cText, true), lp(MATCH, WRAP, 0f, 0, 6, 0, 6))
+        listTitle = tv("قائمة الفيديوهات", 15f, cText, true)
+        col.addView(listTitle, lp(MATCH, WRAP, 0f, 0, 6, 0, 6))
         emptyTv = tv("لا توجد روابط ملتقطة بعد", 14f, cMuted)
         emptyTv.gravity = Gravity.CENTER
         emptyTv.setPadding(0, dp(40), 0, dp(40))
@@ -815,7 +907,83 @@ class MainActivity : Activity() {
         val sv = ScrollView(this)
         sv.setBackgroundColor(cBg)
         sv.addView(col)
+        dlScroll = sv
         return sv
+    }
+
+    private fun allRows(): List<Row> {
+        val out = ArrayList<Row>()
+        for (box in listOf<LinearLayout>(activeBox, list)) {
+            for (i in 0 until box.childCount) (box.getChildAt(i).tag as? Row)?.let { out.add(it) }
+        }
+        return out
+    }
+
+    private fun inFilter(r: Row): Boolean = when (dlFilter) {
+        1 -> r.state == 1 || r.state == 2
+        2 -> r.state == 3
+        3 -> r.state == 0
+        4 -> r.state == 4
+        else -> true
+    }
+
+    private fun setState(r: Row, st: Int) {
+        r.state = st
+        val c = when (st) {
+            1 -> cAccent
+            2 -> Color.parseColor("#E0A030")
+            3 -> Color.parseColor("#3DB36B")
+            4 -> Color.parseColor("#E05A5A")
+            else -> cMuted
+        }
+        val tx = when (st) {
+            1 -> "جارٍ"
+            2 -> "متوقف مؤقتاً"
+            3 -> "مكتمل"
+            4 -> "غير مكتمل"
+            else -> "ملتقط"
+        }
+        r.chip?.let {
+            it.text = tx
+            it.setTextColor(c)
+            it.background = bg(Color.TRANSPARENT, 10, c)
+        }
+        updateCounts()
+    }
+
+    // حذف تحميل: يوقفه إن كان يعمل ويحذف أجزاءه المؤقتة ويزيله من القائمة (الملف المحفوظ في التحميلات لا يُمس)
+    private fun deleteRow(c: Cand) {
+        val r = c.rw
+        r.removed = true
+        r.ctl.paused = false
+        r.ctl.cancelled = true
+        val w = r.work
+        if (r.state != 1 && r.state != 2 && w != null) {
+            Thread { try { w.deleteRecursively() } catch (e: Throwable) {} }.start()
+            r.work = null
+        }
+        (r.view.parent as? ViewGroup)?.removeView(r.view)
+        found.remove(c.url)
+        foundStart.remove(c.url)
+        foundHdr.remove(c.url)
+        cands.remove(c.url)
+        updateCounts()
+        toast("تم الحذف")
+    }
+
+    private fun deleteDialog(c: Cand) {
+        val r = c.rw
+        val msg = when (r.state) {
+            1, 2 -> "سيتوقف التحميل وتُحذف أجزاؤه المؤقتة ويُزال من القائمة."
+            3 -> "يُزال من القائمة فقط. الملف المحفوظ يبقى في مجلد التحميلات."
+            else -> "يُزال من القائمة مع أي أجزاء مؤقتة محفوظة له."
+        }
+        AlertDialog.Builder(this)
+            .setTitle("حذف التحميل")
+            .setMessage(msg)
+            .setPositiveButton("حذف") { _, _ -> deleteRow(c) }
+            .setNegativeButton("إلغاء", null)
+            .show()
     }
 
     private fun toolCard(res: Int, label: String, onClick: () -> Unit): LinearLayout {
@@ -887,6 +1055,7 @@ class MainActivity : Activity() {
             toolCard(R.drawable.ic_add, "تبويب جديد") { newHomeTab() },
             toolCard(R.drawable.ic_home_solid, "الرئيسية") {
                 cur?.start = true
+                cur?.startBack = cur?.web?.url != null
                 updateStart()
                 showPage(0)
             },
@@ -945,44 +1114,17 @@ class MainActivity : Activity() {
                 } catch (e: Exception) {
                     toast("تعذر فتح مجلد التحميلات")
                 }
-            },
-            toolCard(R.drawable.ic_storage, "مخزن التطبيق") { openStorage() }
+            }
         ))
 
-        section(col, "أدوات ذكية")
+        section(col, "التقاط الفيديو")
         grid(col, listOf(
-            toolCard(R.drawable.ic_speed, "التحكم بالسرعة") { showSpeed() },
-            toolCard(R.drawable.ic_chart, "قياس السرعة") { speedTest() },
             toolCard(R.drawable.ic_search_link, "فحص رابط") { inspectLink() },
-            toolCard(R.drawable.ic_report, "تقرير الأداء") { perfReport() },
             toolCard(R.drawable.ic_batch, "التقاط كل فيديوهات الصفحة") { capturePage() },
             toolCard(R.drawable.ic_list, "سجل الالتقاط") { showCapLog() },
             toolCard(R.drawable.ic_search_link, "الروابط المستبعدة") { excludedDialog() }
         ))
 
-        section(col, "التنظيف والذاكرة")
-        grid(col, listOf(
-            toolCard(R.drawable.ic_clean, "مسح الكاش") {
-                for (t in tabs) {
-                    t.web.clearCache(true)
-                    t.web.clearHistory()
-                }
-                toast("تم مسح الكاش والسجل")
-            },
-            toolCard(R.drawable.ic_cookie, "مسح الكوكيز") {
-                CookieManager.getInstance().removeAllCookies(null)
-                CookieManager.getInstance().flush()
-                toast("تم مسح الكوكيز، سيُطلب تسجيل الدخول من جديد")
-            },
-            toolCard(R.drawable.ic_delete, "مسح قائمة التحميلات") { clearFound() },
-            toolCard(R.drawable.ic_image, "مسح الصور المؤقتة") { rcClear() },
-            toolCard(R.drawable.ic_refresh, "تفريغ الذاكرة") { freeMem() }
-        ))
-
-        section(col, "الواجهة")
-        grid(col, listOf(
-            toolCard(R.drawable.ic_resize, "أحجام الأزرار") { showSizes() }
-        ))
         val sv = ScrollView(this)
         sv.setBackgroundColor(cBg)
         sv.addView(col)
@@ -1059,14 +1201,104 @@ class MainActivity : Activity() {
         parent.addView(row, lp(MATCH, WRAP))
     }
 
+
+    // ---------- الإعدادات: قائمة رئيسية + صفحات داخلية (كل إعداد في مكان واحد فقط) ----------
+
+    private lateinit var settingsHost: FrameLayout
+    private var setSub = ""
+
     private fun buildSettings(): View {
+        settingsHost = FrameLayout(this)
+        settingsHost.setBackgroundColor(cBg)
+        openSettingsSub("")
+        return settingsHost
+    }
+
+    private fun openSettingsSub(id: String) {
+        setSub = id
+        hideKb()
+        settingsHost.removeAllViews()
         val col = LinearLayout(this)
         col.orientation = LinearLayout.VERTICAL
         col.setPadding(dp(14), dp(14), dp(14), dp(24))
-        col.addView(tv("الإعدادات", 20f, cText, true), lp(MATCH, WRAP, 0f, 0, 0, 0, 6))
+        if (id.isEmpty()) {
+            col.addView(tv("الإعدادات", 20f, cText, true), lp(MATCH, WRAP, 0f, 0, 0, 0, 2))
+            col.addView(tv("اختر قسماً لعرض إعداداته", 12f, cMuted), lp(MATCH, WRAP, 0f, 0, 0, 0, 6))
+            buildSettingsHub(col)
+        } else {
+            val titles = mapOf(
+                "look" to "المظهر والواجهة", "browse" to "التصفح والبحث", "capture" to "التقاط الفيديو",
+                "net" to "التحميل والشبكة", "perf" to "الأداء والتخزين", "privacy" to "الخصوصية والبيانات", "about" to "حول التطبيق"
+            )
+            val head = LinearLayout(this)
+            head.orientation = LinearLayout.HORIZONTAL
+            head.gravity = Gravity.CENTER_VERTICAL
+            head.addView(iconBtn(R.drawable.ic_back, cText) { openSettingsSub("") }, lp(WRAP, WRAP, 0f, 0, 0, 6, 0))
+            head.addView(tv(titles[id] ?: "الإعدادات", 20f, cText, true), lp(0, WRAP, 1f))
+            col.addView(head, lp(MATCH, WRAP, 0f, 0, 0, 0, 6))
+            when (id) {
+                "look" -> buildSetLook(col)
+                "browse" -> buildSetBrowse(col)
+                "capture" -> buildSetCapture(col)
+                "net" -> buildSetNet(col)
+                "perf" -> buildSetPerf(col)
+                "privacy" -> buildSetPrivacy(col)
+                "about" -> buildSetAbout(col)
+            }
+        }
+        val sv = ScrollView(this)
+        sv.setBackgroundColor(cBg)
+        sv.addView(col)
+        settingsHost.addView(sv, FrameLayout.LayoutParams(MATCH, MATCH))
+    }
 
-        // ---- عام ----
-        section(col, "عام")
+    private fun hubRow(parent: LinearLayout, icon: Int, title: String, sub: String, id: String) {
+        val row = LinearLayout(this)
+        row.orientation = LinearLayout.HORIZONTAL
+        row.gravity = Gravity.CENTER_VERTICAL
+        row.setPadding(dp(14), dp(12), dp(14), dp(12))
+        row.background = bg(cCard, 14, cLine)
+        val ic = ImageView(this)
+        ic.setImageResource(icon)
+        ic.setColorFilter(cAccent)
+        row.addView(ic, lp(dp(26), dp(26), 0f, 0, 0, 12, 0))
+        val txt = LinearLayout(this)
+        txt.orientation = LinearLayout.VERTICAL
+        txt.addView(tv(title, 15f, cText, true))
+        txt.addView(tv(sub, 12f, cMuted))
+        row.addView(txt, lp(0, WRAP, 1f))
+        val ch = ImageView(this)
+        ch.setImageResource(R.drawable.ic_forward)
+        ch.setColorFilter(cMuted)
+        row.addView(ch, lp(dp(20), dp(20)))
+        row.setOnClickListener { openSettingsSub(id) }
+        parent.addView(row, lp(MATCH, WRAP, 0f, 0, 0, 0, 8))
+    }
+
+    private fun buildSettingsHub(col: LinearLayout) {
+        section(col, "التطبيق")
+        hubRow(col, R.drawable.ic_resize, "المظهر والواجهة", "الوضع الداكن وأحجام الأزرار والأيقونات", "look")
+        hubRow(col, R.drawable.ic_web, "التصفح والبحث", "الشاشة الرئيسية ومحرك البحث وحظر الإعلانات", "browse")
+        section(col, "الفيديو والتحميل")
+        hubRow(col, R.drawable.ic_batch, "التقاط الفيديو", "أزرار الفيديو وخطوات الالتقاط وما يظهر في القائمة", "capture")
+        hubRow(col, R.drawable.ic_download, "التحميل والشبكة", "السرعة والاتصالات والمهل والرؤوس والجودة", "net")
+        section(col, "النظام")
+        hubRow(col, R.drawable.ic_speed, "الأداء والتخزين", "توفير البيانات وحفظ الصفحات والذاكرة", "perf")
+        hubRow(col, R.drawable.ic_cookie, "الخصوصية والبيانات", "مسح السجل والكاش والكوكيز", "privacy")
+        hubRow(col, R.drawable.ic_alert, "حول التطبيق", "الإصدار والوصف", "about")
+    }
+
+    private fun buildSetLook(col: LinearLayout) {
+        section(col, "المظهر")
+        val c = settingsCard(col)
+        switchRow(c, "الوضع الداكن", "يتبدل المظهر فوراً مع بقاء التبويبات وهذه الصفحة كما هي", "dark", true) { recreate() }
+        section(col, "الأحجام")
+        val c2 = settingsCard(col)
+        actionRow(c2, "أحجام الأزرار والأيقونات", "تحكم حر بحجم كل زر وكل أيقونة وعدد أعمدة الأدوات", "فتح") { showSizes() }
+    }
+
+    private fun buildSetBrowse(col: LinearLayout) {
+        section(col, "الشاشة الرئيسية والبحث")
         val c0 = settingsCard(col)
         switchRow(c0, "البدء بالشاشة الرئيسية", "تظهر شاشة البحث والمواقع عند بدء التطبيق وعند فتح تبويب جديد", "startscreen", true) { }
 
@@ -1112,10 +1344,8 @@ class MainActivity : Activity() {
             prefs().edit().putString("home", if (v.isEmpty()) HOME else fix(v)).apply()
             toast("تم الحفظ")
         }, lp(MATCH, WRAP, 0f, 0, 8, 0, 8))
-        switchRow(c0, "الوضع الداكن", "تغيير المظهر يعيد تشغيل الواجهة مع الحفاظ على التبويبات", "dark", true) { recreate() }
 
-        // ---- المتصفح ----
-        section(col, "المتصفح")
+        section(col, "الصفحات")
         val c1 = settingsCard(col)
         switchRow(c1, "حظر الإعلانات", "يمنع الطلبات المعروفة لشبكات الإعلانات", "adblock", true) { adBlock = it }
         switchRow(c1, "وضع سطح المكتب", "يفتح المواقع بنسختها الكاملة", "desktop", false) {
@@ -1125,58 +1355,42 @@ class MainActivity : Activity() {
         switchRow(c1, "تشغيل الفيديو تلقائياً", "تشغيل الفيديو بدون لمس الشاشة لالتقاط رابطه", "autoplay", true) {
             for (t in tabs) applyWebSettings(t.web)
         }
-        switchRow(c1, "توفير البيانات", "يمنع تحميل الصور، يفضّل الكاش، يوقف التشغيل التلقائي، ويختار أقل جودة عند التحميل (أعد تحميل الصفحة)", "saver", false) {
-            for (t in tabs) applyWebSettings(t.web)
-            toast("أعد تحميل الصفحة ليسري التغيير")
-        }
-
-        // ---- حفظ الصفحات (مستقل تماماً عن زر توفير البيانات) ----
-        section(col, "حفظ الصفحات")
-        val cp = settingsCard(col)
-        switchRow(cp, "حفظ الصفحات على الجهاز", "تُحفظ الصفحة وبياناتها بعد تحميلها وتُفتح من الجهاز عند الرجوع إليها أو بعد إغلاق التطبيق. زر التحديث يجلب نسخة جديدة. لا علاقة له بزر توفير البيانات", "cachepages", true) {
+        choiceRow(c1, "حجم الخط في الصفحات", "يُطبّق على كل التبويبات", "textzoom", arrayOf("80%", "100%", "120%", "150%"), intArrayOf(80, 100, 120, 150), 100) {
             for (t in tabs) applyWebSettings(t.web)
         }
-        switchRow(cp, "مخزن الصور والأيقونات", "يحفظ كل صورة وأيقونة تظهر في الصفحات على الجهاز حتى لو منع الموقع التخزين، فلا تُحمَّل من جديد في كل مرة (حتى بعد إغلاق التطبيق)", "rescache", true) { }
-        choiceRow(cp, "حجم المخزن الأقصى", "الأصل: بلا حد. إن حددت حجماً فعند الامتلاء تُحذف الأقدم استخداماً أولاً", "rcmb", arrayOf("بلا حد", "500 م.ب", "1000 م.ب", "3000 م.ب"), intArrayOf(0, 500, 1000, 3000), 0) { Thread { rcTrim() }.start() }
-        actionRow(cp, "مسح مخزن الصور", "يحذف الصور المحفوظة فقط", "مسح") { rcClear() }
+    }
 
-        // ---- الفيديو والتحميل ----
-        section(col, "الفيديو والتحميل")
-        val c2 = settingsCard(col)
-        switchRow(c2, "أزرار التحميل على الفيديو", "أزرار تحميل ونسخ وشريط تقديم فوق كل فيديو (تُطبّق عند فتح الصفحة). الصور: اضغط مطولاً على الصورة", "overlay", true) { }
-        numRow(c2, "أقصى خطوات التمرير في الالتقاط", "عدد خطوات التمرير الأعلى. الصفر: يستمر حتى نهاية القائمة", "scanmax", 0)
-        numRow(c2, "خطوات الثبات قبل إنهاء الالتقاط", "كم خطوة تبقى فيها الصفحة بلا جديد قبل الإنهاء. زدها للمواقع البطيئة", "scanstill", 6, "")
-        numRow(c2, "زمن كل خطوة تمرير (ملّي ثانية)", "الانتظار بعد كل تمريرة ليحمّل الموقع المزيد. زدها للمواقع البطيئة", "scandelay", 750, "")
-        switchRow(c2, "تشغيل الفيديوهات أثناء التقاط الصفحة", "عند تفعيله يشغّل التطبيق كل فيديو في الصفحة بصوته الطبيعي أثناء الالتقاط، ولا يوقفه أبداً، فيبقى يعمل حتى توقفه أنت أو تخرج من الصفحة. الأصل: مغلق، والالتقاط يعمل بدونه", "scanplay", false) { }
-        numRow(c2, "حد الثقة في الحكم (%)", "أي رابط تقل ثقة الحكم عليه عن هذه القيمة يظهر دائماً بوسم «تقديري» لتصنفه أنت يدوياً. الصفر: يُعتمد الحكم دائماً", "uncert", 75, "بدون وسم «تقديري»")
-        numRow(c2, "انتظار فحص البث المباشر (ثوانٍ)", "المدة بين فحصي القائمة للتمييز بين المباشر والمسجل. الصفر: تلقائي حسب القائمة", "livewait", 0, "تلقائي")
-        numRow(c2, "خيوط تحليل الروابط", "عدد الخيوط التي تحلل الروابط معاً", "anthreads", 16, "") { applyPools() }
-        numRow(c2, "خيوط فحص الشبكة", "عدد الخيوط التي تفحص طلبات الصفحة معاً", "prthreads", 8, "") { applyPools() }
-        numRow(c2, "حد قراءة الردود غير النصية (كيلوبايت)", "يمنع قراءة ملفات ثنائية ضخمة بحثاً عن روابط. الصفر: بلا حد", "readcap", 0)
-        switchRow(c2, "قراءة البث المستمر (event-stream)", "الأصل: مفعّل. يقرأ البث المستمر بحثاً عن روابط الفيديو. أوقفه فقط إن لاحظت بطئاً أو استهلاكاً للذاكرة (وحد قراءة الردود أعلاه يتحكم بالحجم)", "scanstream", true) { }
-        numRow(c2, "أقصى أسطر سجل الالتقاط المحفوظة", "الصفر: يحتفظ بكل الأسطر حتى تغلق التطبيق", "logcap", 0)
-        numRow(c2, "أسطر السجل المعروضة في النافذة", "الصفر: يعرض الكل. زر النسخ ينسخ الكل دائماً", "logshow", 0, "الكل")
-        switchRow(c2, "التقاط الملفات الصوتية", "mp3 و aac و m4a و ogg و opus و wav و flac تظهر في قائمة الروابط مثل الفيديو", "capaudio", true) { }
-        switchRow(c2, "التقاط ملفات ts و m4s المستقلة", "أي ملف ts أو m4s ليس جزءاً من قائمة بث معروفة يُلتقط ويظهر", "capseg", true) { }
-        switchRow(c2, "إظهار أجزاء القوائم المعروفة", "الأصل: مغلق حتى لا تمتلئ القائمة بمئات الأجزاء، فالفيديو الكامل يظهر عبر ملف m3u8 أو mpd. فعّله لترى كل جزء بنفسه", "showseg", false) { }
-        numRow(c2, "أقصى عدد أزرار تحميل فوق الفيديوهات في الصفحة", "عدد عناصر الفيديو التي يضع التطبيق عليها أزرار التحميل. الصفر: بلا حد (يُطبّق عند فتح الصفحة)", "maxoverlay", 0)
-        switchRow(c2, "محاولة التحميل رغم علامة DRM", "الأصل: مغلق. فك تشفير DRM غير ممكن، فالمحاولة تحفظ بيانات مشفّرة غالباً لا تعمل. تفعيله يلغي الرفض ويترك لك القرار", "ignoredrm", false) { }
-        switchRow(c2, "تحميل خام عند تشفير HLS غير مدعوم", "التطبيق يفك AES-128 فقط. عند أي تشفير آخر مثل SAMPLE-AES يرفض افتراضياً. تفعيله يحمّل الأجزاء كما هي بدون فك", "ignoreenc", false) { }
-        numRow(c2, "أقصى عدد تحويلات الروابط (redirects)", "الصفر: بلا حد", "redirects", 30)
-        numRow(c2, "مهلة الاتصال (ثوانٍ)", "الصفر: ينتظر بلا مهلة. زدها للخوادم البطيئة", "conntimeout", 45, "بلا مهلة")
-        numRow(c2, "مهلة القراءة (ثوانٍ)", "الصفر: ينتظر بلا مهلة. زدها للخوادم البطيئة", "readtimeout", 120, "بلا مهلة")
-        actionRow(c2, "رؤوس HTTP مخصصة", "سطر لكل رأس بصيغة Name: value (مثل Referer أو User-Agent أو Cookie). تُضاف لكل طلب فحص وتحميل وتتغلب على القيم التلقائية، وتحل مشكلة المواقع التي ترفض التحميل", "تعديل") {
-            val et = EditText(this)
-            et.setText(prefs().getString("customhdr", ""))
-            et.hint = "Referer: https://example.com/"
-            et.minLines = 4
-            et.gravity = Gravity.TOP
-            et.layoutDirection = View.LAYOUT_DIRECTION_LTR
-            AlertDialog.Builder(this).setTitle("رؤوس HTTP مخصصة").setView(et)
-                .setPositiveButton("حفظ") { _, _ -> prefs().edit().putString("customhdr", et.text.toString()).apply(); toast("تم الحفظ") }
-                .setNegativeButton("إلغاء", null).show()
-        }
-        switchRow(c2, "إظهار البث المباشر", "الأصل: مفعّل، فيظهر المسجل والمباشر. أوقفه لإخفاء البث المباشر (ما أُخفي يبقى في «الروابط المستبعدة»)", "showlive", true) { }
+    private fun buildSetCapture(col: LinearLayout) {
+        section(col, "الالتقاط")
+        val g1 = settingsCard(col)
+        switchRow(g1, "أزرار التحميل على الفيديو", "أزرار تحميل ونسخ وشريط تقديم فوق كل فيديو (تُطبّق عند فتح الصفحة). الصور: اضغط مطولاً على الصورة", "overlay", true) { }
+        numRow(g1, "أقصى خطوات التمرير في الالتقاط", "عدد خطوات التمرير الأعلى. الصفر: يستمر حتى نهاية القائمة", "scanmax", 0)
+        numRow(g1, "خطوات الثبات قبل إنهاء الالتقاط", "كم خطوة تبقى فيها الصفحة بلا جديد قبل الإنهاء. زدها للمواقع البطيئة", "scanstill", 6, "")
+        numRow(g1, "زمن كل خطوة تمرير (ملّي ثانية)", "الانتظار بعد كل تمريرة ليحمّل الموقع المزيد. زدها للمواقع البطيئة", "scandelay", 750, "")
+        switchRow(g1, "تشغيل الفيديوهات أثناء التقاط الصفحة", "عند تفعيله يشغّل التطبيق كل فيديو في الصفحة بصوته الطبيعي أثناء الالتقاط، ولا يوقفه أبداً، فيبقى يعمل حتى توقفه أنت أو تخرج من الصفحة. الأصل: مغلق، والالتقاط يعمل بدونه", "scanplay", false) { }
+        switchRow(g1, "قراءة البث المستمر (event-stream)", "الأصل: مفعّل. يقرأ البث المستمر بحثاً عن روابط الفيديو. أوقفه فقط إن لاحظت بطئاً أو استهلاكاً للذاكرة (وحد قراءة الردود أعلاه يتحكم بالحجم)", "scanstream", true) { }
+        numRow(g1, "أقصى عدد أزرار تحميل فوق الفيديوهات في الصفحة", "عدد عناصر الفيديو التي يضع التطبيق عليها أزرار التحميل. الصفر: بلا حد (يُطبّق عند فتح الصفحة)", "maxoverlay", 0)
+
+        section(col, "ما يظهر في القائمة")
+        val g2 = settingsCard(col)
+        numRow(g2, "حد الثقة في الحكم (%)", "أي رابط تقل ثقة الحكم عليه عن هذه القيمة يظهر دائماً بوسم «تقديري» لتصنفه أنت يدوياً. الصفر: يُعتمد الحكم دائماً", "uncert", 75, "بدون وسم «تقديري»")
+        numRow(g2, "انتظار فحص البث المباشر (ثوانٍ)", "المدة بين فحصي القائمة للتمييز بين المباشر والمسجل. الصفر: تلقائي حسب القائمة", "livewait", 0, "تلقائي")
+        switchRow(g2, "التقاط الملفات الصوتية", "mp3 و aac و m4a و ogg و opus و wav و flac تظهر في قائمة الروابط مثل الفيديو", "capaudio", true) { }
+        switchRow(g2, "التقاط ملفات ts و m4s المستقلة", "أي ملف ts أو m4s ليس جزءاً من قائمة بث معروفة يُلتقط ويظهر", "capseg", true) { }
+        switchRow(g2, "إظهار أجزاء القوائم المعروفة", "الأصل: مغلق حتى لا تمتلئ القائمة بمئات الأجزاء، فالفيديو الكامل يظهر عبر ملف m3u8 أو mpd. فعّله لترى كل جزء بنفسه", "showseg", false) { }
+        switchRow(g2, "إظهار البث المباشر", "الأصل: مفعّل، فيظهر المسجل والمباشر. أوقفه لإخفاء البث المباشر (ما أُخفي يبقى في «الروابط المستبعدة»)", "showlive", true) { }
+
+        section(col, "سجل الالتقاط")
+        val g3 = settingsCard(col)
+        numRow(g3, "أقصى أسطر سجل الالتقاط المحفوظة", "الصفر: يحتفظ بكل الأسطر حتى تغلق التطبيق", "logcap", 0)
+        numRow(g3, "أسطر السجل المعروضة في النافذة", "الصفر: يعرض الكل. زر النسخ ينسخ الكل دائماً", "logshow", 0, "الكل")
+    }
+
+    private fun buildSetNet(col: LinearLayout) {
+        section(col, "التحميل")
+        val g3 = settingsCard(col)
+        switchRow(g3, "محاولة التحميل رغم علامة DRM", "الأصل: مغلق. فك تشفير DRM غير ممكن، فالمحاولة تحفظ بيانات مشفّرة غالباً لا تعمل. تفعيله يلغي الرفض ويترك لك القرار", "ignoredrm", false) { }
+        switchRow(g3, "تحميل خام عند تشفير HLS غير مدعوم", "التطبيق يفك AES-128 فقط. عند أي تشفير آخر مثل SAMPLE-AES يرفض افتراضياً. تفعيله يحمّل الأجزاء كما هي بدون فك", "ignoreenc", false) { }
         val cnt = tv("" + prefs().getInt("threads", 8), 16f, cText, true)
         cnt.gravity = Gravity.CENTER
         cnt.minWidth = dp(34)
@@ -1197,8 +1411,7 @@ class MainActivity : Activity() {
         thrRow.addView(pill("+", false) { setThr(prefs().getInt("threads", 8) + 1) })
         thrRow.addView(cnt)
         thrRow.addView(pill("−", false) { setThr(prefs().getInt("threads", 8) - 1) })
-        c2.addView(thrRow, lp(MATCH, WRAP))
-
+        g3.addView(thrRow, lp(MATCH, WRAP))
         val qRow = LinearLayout(this)
         qRow.orientation = LinearLayout.HORIZONTAL
         qRow.gravity = Gravity.CENTER_VERTICAL
@@ -1220,30 +1433,64 @@ class MainActivity : Activity() {
         qRow.addView(qTxt, lp(0, WRAP, 1f))
         qRow.addView(hi, lp(WRAP, WRAP, 0f, 0, 0, 6, 0))
         qRow.addView(lo)
-        c2.addView(qRow, lp(MATCH, WRAP))
+        g3.addView(qRow, lp(MATCH, WRAP))
+        actionRow(g3, "التحكم بالسرعة", "حد السرعة الحر وعدد الاتصالات وعدد التحميلات المتزامنة (بلا قيود)", "ضبط") { showSpeed() }
+        actionRow(g3, "قياس سرعة الشبكة", "يقيس سرعتك الفعلية ويقترح أفضل عدد اتصالات", "قياس") { speedTest() }
 
-        // ---- الواجهة ----
-        section(col, "الواجهة")
-        val c6 = settingsCard(col)
-        actionRow(c6, "أحجام الأزرار والأيقونات", "تحكم حر بحجم كل زر وكل أيقونة وعدد أعمدة الأدوات", "فتح") { showSizes() }
+        section(col, "الاتصال")
+        val g1 = settingsCard(col)
+        numRow(g1, "أقصى عدد تحويلات الروابط (redirects)", "الصفر: بلا حد", "redirects", 30)
+        numRow(g1, "مهلة الاتصال (ثوانٍ)", "الصفر: ينتظر بلا مهلة. زدها للخوادم البطيئة", "conntimeout", 45, "بلا مهلة")
+        numRow(g1, "مهلة القراءة (ثوانٍ)", "الصفر: ينتظر بلا مهلة. زدها للخوادم البطيئة", "readtimeout", 120, "بلا مهلة")
+        actionRow(g1, "رؤوس HTTP مخصصة", "سطر لكل رأس بصيغة Name: value (مثل Referer أو User-Agent أو Cookie). تُضاف لكل طلب فحص وتحميل وتتغلب على القيم التلقائية، وتحل مشكلة المواقع التي ترفض التحميل", "تعديل") {
+            val et = EditText(this)
+            et.setText(prefs().getString("customhdr", ""))
+            et.hint = "Referer: https://example.com/"
+            et.minLines = 4
+            et.gravity = Gravity.TOP
+            et.layoutDirection = View.LAYOUT_DIRECTION_LTR
+            AlertDialog.Builder(this).setTitle("رؤوس HTTP مخصصة").setView(et)
+                .setPositiveButton("حفظ") { _, _ -> prefs().edit().putString("customhdr", et.text.toString()).apply(); toast("تم الحفظ") }
+                .setNegativeButton("إلغاء", null).show()
+        }
 
-        // ---- السرعة والأداء ----
-        section(col, "السرعة والأداء")
+        section(col, "التحليل والفحص")
+        val g2 = settingsCard(col)
+        numRow(g2, "خيوط تحليل الروابط", "عدد الخيوط التي تحلل الروابط معاً", "anthreads", 16, "") { applyPools() }
+        numRow(g2, "خيوط فحص الشبكة", "عدد الخيوط التي تفحص طلبات الصفحة معاً", "prthreads", 8, "") { applyPools() }
+        numRow(g2, "حد قراءة الردود غير النصية (كيلوبايت)", "يمنع قراءة ملفات ثنائية ضخمة بحثاً عن روابط. الصفر: بلا حد", "readcap", 0)
+    }
+
+    private fun buildSetPerf(col: LinearLayout) {
+        section(col, "البيانات والصفحات")
+        val c1 = settingsCard(col)
+        switchRow(c1, "توفير البيانات", "يمنع تحميل الصور، يفضّل الكاش، يوقف التشغيل التلقائي، ويختار أقل جودة عند التحميل (أعد تحميل الصفحة)", "saver", false) {
+            for (t in tabs) applyWebSettings(t.web)
+            toast("أعد تحميل الصفحة ليسري التغيير")
+        }
+        choiceRow(c1, "مهلة تحميل الصفحة", "يوقف الصفحة البطيئة تلقائياً بعد هذه المدة", "pgtimeout", arrayOf("بلا مهلة", "15 ثانية", "30 ثانية", "60 ثانية"), intArrayOf(0, 15, 30, 60), 0)
+
+        // حفظ الصفحات (مستقل تماماً عن زر توفير البيانات)
+        section(col, "حفظ الصفحات والصور")
+        val cp = settingsCard(col)
+        switchRow(cp, "حفظ الصفحات على الجهاز", "تُحفظ الصفحة وبياناتها بعد تحميلها وتُفتح من الجهاز عند الرجوع إليها أو بعد إغلاق التطبيق. زر التحديث يجلب نسخة جديدة. لا علاقة له بزر توفير البيانات", "cachepages", true) {
+            for (t in tabs) applyWebSettings(t.web)
+        }
+        switchRow(cp, "مخزن الصور والأيقونات", "يحفظ كل صورة وأيقونة تظهر في الصفحات على الجهاز حتى لو منع الموقع التخزين، فلا تُحمَّل من جديد في كل مرة (حتى بعد إغلاق التطبيق)", "rescache", true) { }
+        choiceRow(cp, "حجم المخزن الأقصى", "الأصل: بلا حد. إن حددت حجماً فعند الامتلاء تُحذف الأقدم استخداماً أولاً", "rcmb", arrayOf("بلا حد", "500 م.ب", "1000 م.ب", "3000 م.ب"), intArrayOf(0, 500, 1000, 3000), 0) { Thread { rcTrim() }.start() }
+        actionRow(cp, "مسح مخزن الصور", "يحذف الصور المحفوظة فقط", "مسح") { rcClear() }
+
+        section(col, "السرعة والذاكرة")
         val c3 = settingsCard(col)
         switchRow(c3, "إيقاف التبويبات الخلفية", "يوقف نشاط التبويبات المخفية لتسريع التبويب الحالي وتوفير الذاكرة والبطارية", "pausebg", true) {
             cur?.let { switchTo(it) }
         }
-        actionRow(c3, "التحكم بالسرعة", "حد السرعة الحر وعدد الاتصالات وعدد التحميلات المتزامنة (بلا قيود)", "ضبط") { showSpeed() }
-        actionRow(c3, "قياس سرعة الشبكة", "يقيس سرعتك الفعلية ويقترح أفضل عدد اتصالات", "قياس") { speedTest() }
-        choiceRow(c3, "مهلة تحميل الصفحة", "يوقف الصفحة البطيئة تلقائياً بعد هذه المدة", "pgtimeout", arrayOf("بلا مهلة", "15 ثانية", "30 ثانية", "60 ثانية"), intArrayOf(0, 15, 30, 60), 0)
-        choiceRow(c3, "حجم الخط في الصفحات", "يُطبّق على كل التبويبات", "textzoom", arrayOf("80%", "100%", "120%", "150%"), intArrayOf(80, 100, 120, 150), 100) {
-            for (t in tabs) applyWebSettings(t.web)
-        }
         actionRow(c3, "تقرير الأداء", "التبويبات والذاكرة والتحميلات", "عرض") { perfReport() }
         actionRow(c3, "تفريغ الذاكرة", "يمسح ذاكرة التبويبات الخلفية", "تفريغ") { freeMem() }
+    }
 
-        // ---- الخصوصية والبيانات ----
-        section(col, "الخصوصية والبيانات")
+    private fun buildSetPrivacy(col: LinearLayout) {
+        section(col, "مسح البيانات")
         val c5 = settingsCard(col)
         actionRow(c5, "سجل التصفح", "حذف كل الصفحات المسجلة", "مسح") {
             clearHistory()
@@ -1261,9 +1508,9 @@ class MainActivity : Activity() {
             CookieManager.getInstance().flush()
             toast("تم مسح الكوكيز")
         }
+    }
 
-        // ---- حول ----
-        section(col, "حول التطبيق")
+    private fun buildSetAbout(col: LinearLayout) {
         val c4 = settingsCard(col)
         c4.gravity = Gravity.CENTER_HORIZONTAL
         val logo = ImageView(this)
@@ -1279,11 +1526,6 @@ class MainActivity : Activity() {
         val desc = tv("متصفح يلتقط روابط الفيديو (m3u8 / mp4) ويحمّلها ويدمج أجزاءها في ملف واحد داخل مجلد التحميلات.", 12f, cMuted)
         desc.gravity = Gravity.CENTER
         c4.addView(desc, lp(MATCH, WRAP, 0f, 0, 6, 0, 6))
-
-        val sv = ScrollView(this)
-        sv.setBackgroundColor(cBg)
-        sv.addView(col)
-        return sv
     }
 
     // ---------- الشاشة الرئيسية (بحث + مواقع + مفضلة + اختصارات) ----------
@@ -1805,7 +2047,7 @@ class MainActivity : Activity() {
                 tmp.webViewClient = object : WebViewClient() {
                     override fun shouldOverrideUrlLoading(x: WebView, r: WebResourceRequest): Boolean {
                         val u = r.url.toString()
-                        ui.post { newTab(u) }
+                        ui.post { newTab(u, true) }
                         try { x.destroy() } catch (e: Throwable) {}
                         return true
                     }
@@ -1889,6 +2131,7 @@ class MainActivity : Activity() {
                     t.start = false
                     if (cur === t) updateStart()
                 }
+                t.startBack = false
                 t.loading = true
                 t.injected = false
                 t.progress = 5
@@ -2025,8 +2268,9 @@ class MainActivity : Activity() {
         t.close = x
     }
 
-    private fun newTab(url: String) {
+    private fun newTab(url: String, popup: Boolean = false) {
         val t = Tab(makeWeb())
+        t.popup = popup
         buildChip(t)
         if (url.isBlank()) t.start = true
         tabs.add(t)
@@ -2501,6 +2745,7 @@ class MainActivity : Activity() {
     private fun load(u: String) {
         hideKb()
         cur?.start = false
+        cur?.startBack = false
         updateStart()
         cur?.web?.loadUrl(fix(u))
         showPage(0)
@@ -3467,11 +3712,38 @@ function deep(){
     if(html.length!==lastLen){lastLen=html.length;sc(html);}
   }catch(e){}
 }
-function mk(txt,fn){
+var POS={fx:0.5,fy:0.04};
+try{
+  var sp=localStorage.getItem('__tdlpos');
+  if(sp){
+    var po=JSON.parse(sp);
+    if(isFinite(po.fx)&&isFinite(po.fy)){POS.fx=Math.min(1,Math.max(0,po.fx));POS.fy=Math.min(1,Math.max(0,po.fy));}
+  }
+}catch(e){}
+function savePos(){try{localStorage.setItem('__tdlpos',JSON.stringify(POS));}catch(e){}}
+var P_LINK='M3.9,12c0,-1.71 1.39,-3.1 3.1,-3.1h4V7H7c-2.76,0 -5,2.24 -5,5s2.24,5 5,5h4v-1.9H7c-1.71,0 -3.1,-1.39 -3.1,-3.1zM8,13h8v-2H8v2zM17,7h-4v1.9h4c1.71,0 3.1,1.39 3.1,3.1s-1.39,3.1 -3.1,3.1h-4V17h4c2.76,0 5,-2.24 5,-5s-2.24,-5 -5,-5z';
+var P_DL='M19,9h-4V3H9v6H5l7,7 7,-7zM5,18v2h14v-2H5z';
+var P_RT='M17.65,6.35C16.2,4.9 14.21,4 12,4c-4.42,0 -7.99,3.58 -7.99,8s3.57,8 7.99,8c3.73,0 6.84,-2.55 7.73,-6h-2.08c-0.82,2.33 -3.04,4 -5.65,4 -3.31,0 -6,-2.69 -6,-6s2.69,-6 6,-6c1.66,0 3.14,0.69 4.22,1.78L13,11h7V4l-2.35,2.35z';
+function ico(d){
+  var NS='http://www.w3.org/2000/svg';
+  var sv=document.createElementNS(NS,'svg');
+  sv.setAttribute('viewBox','0 0 24 24');
+  sv.setAttribute('width','20');sv.setAttribute('height','20');
+  sv.setAttribute('fill','#fff');
+  var pa=document.createElementNS(NS,'path');
+  pa.setAttribute('d',d);
+  sv.appendChild(pa);
+  return sv;
+}
+function mk(d,fn,st){
   var b=document.createElement('div');
-  b.textContent=txt;
-  b.setAttribute('style','width:26px;height:26px;line-height:26px;text-align:center;font:14px sans-serif;color:#fff;background:rgba(0,0,0,.65);border-radius:13px;margin:2px;cursor:pointer;-webkit-user-select:none;user-select:none;');
-  b.addEventListener('click',function(e){e.stopPropagation();e.preventDefault();fn();},true);
+  b.appendChild(ico(d));
+  b.setAttribute('style','flex:0 0 auto;width:32px;height:32px;display:flex;align-items:center;justify-content:center;background:rgba(255,255,255,.16);border-radius:16px;cursor:pointer;-webkit-user-select:none;user-select:none;');
+  b.addEventListener('click',function(e){
+    e.stopPropagation();e.preventDefault();
+    if(st&&st.moved){st.moved=false;return;}
+    fn();
+  },true);
   return b;
 }
 function srcOf(v){
@@ -3485,82 +3757,148 @@ function fmt(t){
   var m=Math.floor(t/60),s=t%60;
   return m+':'+(s<10?'0':'')+s;
 }
+function visRect(el){
+  var r=el.getBoundingClientRect();
+  var l=Math.max(r.left,0),t=Math.max(r.top,0);
+  var rr=Math.min(r.right,window.innerWidth),bb=Math.min(r.bottom,window.innerHeight);
+  return {l:l,t:t,w:Math.max(rr-l,0),h:Math.max(bb-t,0)};
+}
+function place(st,el){
+  var v=visRect(el);
+  var bw=st.box.offsetWidth,bh=st.box.offsetHeight;
+  var x=v.l+POS.fx*Math.max(v.w-bw,0);
+  var y=v.t+POS.fy*Math.max(v.h-bh,0);
+  st.box.style.transform='translate('+Math.round(x)+'px,'+Math.round(y)+'px)';
+}
+function setSl(st,f){
+  st.fil.style.width=(f*100)+'%';
+  st.thb.style.left=(f*100)+'%';
+}
+// أيقونة واحدة لكل فيديو: [نسخ الرابط] [شريط المدة] [تحميل]، وتُسحب بإصبع من أي مكان فيها عدا الشريط
 function setup(el){
-  var isV=el.tagName==='VIDEO';
-  var st={box:null,isV:isV,ok:false,stalled:false,wt:null,drag:false,errSent:false,sl:null,tm:null,rt:null,lastTxt:''};
+  var st={box:null,isV:true,ok:false,stalled:false,wt:null,drag:false,dragging:false,moved:false,errSent:false,sl:null,tm:null,rt:null,mid:null,lastTxt:'',lastW:''};
   var box=document.createElement('div');
   box.className='__tdl';
-  box.setAttribute('style','position:fixed;left:0;top:0;z-index:2147483647;display:none;flex-direction:column;align-items:flex-start;pointer-events:none;direction:ltr;will-change:transform;');
-  var row=document.createElement('div');
-  row.setAttribute('style','display:flex;pointer-events:auto;');
-  var dl=mk('\u2B07',function(){
-    if(!has()){return;}
-    TDL.video(srcOf(el),location.href);
-  });
-  var cp=mk('\uD83D\uDD17',function(){
+  box.setAttribute('style','position:fixed;left:0;top:0;z-index:2147483647;display:none;flex-direction:row;align-items:center;gap:6px;padding:5px 7px;background:rgba(0,0,0,.74);border-radius:24px;direction:ltr;box-sizing:border-box;will-change:transform;touch-action:none;pointer-events:auto;-webkit-user-select:none;user-select:none;');
+  var cp=mk(P_LINK,function(){
     if(!has()){return;}
     TDL.copyVideo(srcOf(el));
-  });
-  row.appendChild(dl);
-  row.appendChild(cp);
-  if(isV){
-    var rt=mk('\u27F3',function(){
-      var t=el.currentTime;
-      if(el.error||el.networkState===3){
-        try{el.load();}catch(e){}
-        var f=function(){
-          el.removeEventListener('loadedmetadata',f);
-          try{el.currentTime=t;}catch(e){}
-          try{el.play();}catch(e){}
-        };
-        el.addEventListener('loadedmetadata',f);
-      }else{
+  },st);
+  var mid=document.createElement('div');
+  mid.setAttribute('style','flex:1 1 auto;min-width:0;display:flex;flex-direction:column;align-items:stretch;justify-content:center;');
+  var grip=document.createElement('div');
+  grip.setAttribute('style','width:30px;height:4px;border-radius:2px;background:rgba(255,255,255,.75);margin:0 auto 3px auto;');
+  var sl=document.createElement('div');
+  sl.setAttribute('style','position:relative;width:100%;height:20px;margin:0;padding:0;display:none;touch-action:none;');
+  var trk=document.createElement('div');
+  trk.setAttribute('style','position:absolute;left:0;right:0;top:8px;height:4px;border-radius:2px;background:rgba(255,255,255,.3);');
+  var fil=document.createElement('div');
+  fil.setAttribute('style','position:absolute;left:0;top:8px;height:4px;width:0;border-radius:2px;background:#5B9BFF;');
+  var thb=document.createElement('div');
+  thb.setAttribute('style','position:absolute;top:4px;left:0;width:12px;height:12px;margin-left:-6px;border-radius:6px;background:#5B9BFF;box-shadow:0 0 0 2px rgba(0,0,0,.35);');
+  sl.appendChild(trk);sl.appendChild(fil);sl.appendChild(thb);
+  st.fil=fil;st.thb=thb;st.val=0;
+  var tm=document.createElement('div');
+  tm.setAttribute('style','font:11px sans-serif;color:#fff;text-align:center;display:none;');
+  mid.appendChild(grip);
+  mid.appendChild(sl);
+  mid.appendChild(tm);
+  var rt=mk(P_RT,function(){
+    var t=el.currentTime;
+    if(el.error||el.networkState===3){
+      try{el.load();}catch(e){}
+      var f=function(){
+        el.removeEventListener('loadedmetadata',f);
+        try{el.currentTime=t;}catch(e){}
         try{el.play();}catch(e){}
-      }
-      st.stalled=false;st.errSent=false;
-    });
-    rt.style.display='none';
-    row.appendChild(rt);
-    st.rt=rt;
-    var sl=document.createElement('input');
-    sl.type='range';sl.min=0;sl.max=1000;sl.value=0;
-    sl.setAttribute('style','pointer-events:auto;width:200px;height:22px;margin:2px;display:none;');
-    var stop=function(e){e.stopPropagation();};
-    ['touchstart','touchmove','touchend','mousedown','mouseup','click'].forEach(function(n){sl.addEventListener(n,stop,false);});
-    sl.addEventListener('input',function(){
-      st.drag=true;
-      if(isFinite(el.duration)&&el.duration>0){
-        try{el.currentTime=el.duration*sl.value/1000;}catch(e){}
-      }
-    });
-    sl.addEventListener('change',function(){st.drag=false;});
-    var tm=document.createElement('div');
-    tm.setAttribute('style','font:11px sans-serif;color:#fff;background:rgba(0,0,0,.65);border-radius:8px;padding:1px 6px;margin:0 2px;display:none;');
-    box.appendChild(row);
-    box.appendChild(sl);
-    box.appendChild(tm);
-    st.sl=sl;st.tm=tm;
-    var clr=function(){if(st.wt){clearTimeout(st.wt);st.wt=null;}st.stalled=false;st.errSent=false;};
-    el.addEventListener('waiting',function(){
-      if(!st.wt){st.wt=setTimeout(function(){st.stalled=true;st.wt=null;},6000);}
-    });
-    el.addEventListener('playing',clr);
-    el.addEventListener('canplay',clr);
-    el.addEventListener('timeupdate',function(){if(st.wt||st.stalled){clr();}});
-    el.addEventListener('error',function(){
-      st.stalled=true;
-      if(!st.errSent&&has()){
-        st.errSent=true;
-        var c=el.error?el.error.code:0;
-        TDL.err('توقف الفيديو (رمز '+c+'): '+srcOf(el).slice(0,150));
-      }
-    });
-  }
+      };
+      el.addEventListener('loadedmetadata',f);
+    }else{
+      try{el.play();}catch(e){}
+    }
+    st.stalled=false;st.errSent=false;
+  },st);
+  rt.style.display='none';
+  var dl=mk(P_DL,function(){
+    if(!has()){return;}
+    TDL.video(srcOf(el),location.href);
+  },st);
+  box.appendChild(cp);
+  box.appendChild(mid);
+  box.appendChild(rt);
+  box.appendChild(dl);
+  st.sl=sl;st.tm=tm;st.rt=rt;st.mid=mid;
+  var stop=function(e){e.stopPropagation();};
+  ['touchstart','touchmove','touchend','mousedown','mouseup','click'].forEach(function(n){sl.addEventListener(n,stop,false);});
+  var seekAt=function(cx){
+    var rc=sl.getBoundingClientRect();
+    var f=rc.width>0?Math.min(1,Math.max(0,(cx-rc.left)/rc.width)):0;
+    st.val=Math.round(f*1000);
+    setSl(st,f);
+    if(isFinite(el.duration)&&el.duration>0){try{el.currentTime=el.duration*f;}catch(e){}}
+  };
+  sl.addEventListener('touchstart',function(e){st.drag=true;seekAt(e.touches[0].clientX);e.preventDefault();},{passive:false});
+  sl.addEventListener('touchmove',function(e){if(st.drag){seekAt(e.touches[0].clientX);e.preventDefault();}},{passive:false});
+  var sEnd=function(){st.drag=false;};
+  sl.addEventListener('touchend',sEnd,false);
+  sl.addEventListener('touchcancel',sEnd,false);
+  var mm=function(e){if(st.drag){seekAt(e.clientX);}};
+  sl.addEventListener('mousedown',function(e){st.drag=true;seekAt(e.clientX);
+    var up=function(){st.drag=false;document.removeEventListener('mousemove',mm,true);document.removeEventListener('mouseup',up,true);};
+    document.addEventListener('mousemove',mm,true);document.addEventListener('mouseup',up,true);});
+  // سحب الأيقونة من مكانها (يُحفظ المكان ويُطبَّق على كل الفيديوهات)
+  var tx0=0,ty0=0,bx0=0,by0=0,tr=false;
+  box.addEventListener('touchstart',function(e){
+    if(e.touches.length!==1){return;}
+    var t=e.touches[0],rc=box.getBoundingClientRect();
+    tx0=t.clientX;ty0=t.clientY;bx0=rc.left;by0=rc.top;tr=true;st.dragging=false;
+  },{passive:true});
+  box.addEventListener('touchmove',function(e){
+    if(!tr){return;}
+    var t=e.touches[0],dx=t.clientX-tx0,dy=t.clientY-ty0;
+    if(!st.dragging){
+      if(Math.abs(dx)+Math.abs(dy)<8){return;}
+      st.dragging=true;st.moved=true;
+    }
+    e.preventDefault();
+    var v=visRect(el),bw=box.offsetWidth,bh=box.offsetHeight;
+    var rx=Math.max(v.w-bw,1),ry=Math.max(v.h-bh,1);
+    POS.fx=Math.min(1,Math.max(0,(bx0+dx-v.l)/rx));
+    POS.fy=Math.min(1,Math.max(0,(by0+dy-v.t)/ry));
+    place(st,el);
+  },{passive:false});
+  var endDrag=function(){
+    if(!tr){return;}
+    tr=false;
+    if(st.dragging){
+      st.dragging=false;
+      savePos();
+      setTimeout(function(){st.moved=false;},350);
+    }
+  };
+  box.addEventListener('touchend',endDrag,{passive:true});
+  box.addEventListener('touchcancel',endDrag,{passive:true});
+  box.addEventListener('click',function(e){e.stopPropagation();},false);
+  var clr=function(){if(st.wt){clearTimeout(st.wt);st.wt=null;}st.stalled=false;st.errSent=false;};
+  el.addEventListener('waiting',function(){
+    if(!st.wt){st.wt=setTimeout(function(){st.stalled=true;st.wt=null;},6000);}
+  });
+  el.addEventListener('playing',clr);
+  el.addEventListener('canplay',clr);
+  el.addEventListener('timeupdate',function(){if(st.wt||st.stalled){clr();}});
+  el.addEventListener('error',function(){
+    st.stalled=true;
+    if(!st.errSent&&has()){
+      st.errSent=true;
+      var c=el.error?el.error.code:0;
+      TDL.err('توقف الفيديو (رمز '+c+'): '+srcOf(el).slice(0,150));
+    }
+  });
   document.body.appendChild(box);
   st.box=box;
   map.set(el,st);
 }
-// خفيف: يُستدعى أثناء التمرير وكل 300 مللي ثانية، يحرّك الأزرار مع العنصر
+// خفيف: يُستدعى أثناء التمرير وكل 400 مللي ثانية، يحرّك الأيقونة مع الفيديو
 function upd(){
   var vw=window.innerWidth,vh=window.innerHeight;
   map.forEach(function(st,el){
@@ -3571,22 +3909,20 @@ function upd(){
       return;
     }
     if(st.box.style.display!=='flex'){st.box.style.display='flex';}
-    var x=Math.max(r.left,0)+4,y=Math.max(r.top,0)+4;
-    st.box.style.transform='translate('+x+'px,'+y+'px)';
-    if(st.isV){
-      var d=el.duration;
-      var ok=isFinite(d)&&d>0;
-      var dsp=ok?'block':'none';
-      if(st.sl.style.display!==dsp){st.sl.style.display=dsp;st.tm.style.display=dsp;}
-      if(ok){
-        st.sl.style.width=Math.max(80,Math.min(r.width-12,240))+'px';
-        if(!st.drag){st.sl.value=Math.round(el.currentTime/d*1000);}
-        var tx=fmt(el.currentTime)+' / '+fmt(d);
-        if(tx!==st.lastTxt){st.lastTxt=tx;st.tm.textContent=tx;}
-      }
-      var rs=(st.stalled||el.error)?'block':'none';
-      if(st.rt.style.display!==rs){st.rt.style.display=rs;}
+    var d=el.duration;
+    var ok=isFinite(d)&&d>0;
+    var dsp=ok?'block':'none';
+    if(st.sl.style.display!==dsp){st.sl.style.display=dsp;st.tm.style.display=dsp;}
+    var w=ok?Math.max(170,Math.min(r.width-12,300))+'px':'';
+    if(w!==st.lastW){st.lastW=w;st.box.style.width=w;}
+    if(ok){
+      if(!st.drag){setSl(st,Math.min(1,Math.max(0,el.currentTime/d)));}
+      var tx=fmt(el.currentTime)+' / '+fmt(d);
+      if(tx!==st.lastTxt){st.lastTxt=tx;st.tm.textContent=tx;}
     }
+    var rs=(st.stalled||el.error)?'block':'none';
+    if(st.rt.style.display!==rs){st.rt.style.display=rs;}
+    if(!st.dragging){place(st,el);}
   });
 }
 function scan(){
@@ -3635,16 +3971,52 @@ deep();
 
     private fun updateCounts() {
         val n = found.size
-        badge.visibility = if (n > 0 && page == 0) View.VISIBLE else View.GONE
-        badge.text = "تحميل ($n)"
         val bc = candsOf(cur).size
-        dlFab.visibility = if (bc > 0 && page == 0) View.VISIBLE else View.GONE
+        badge.visibility = if (n > 0) View.VISIBLE else View.GONE
+        badge.text = "عداد ملتقط الروابط ($n)"
+        dlFab.visibility = if (bc > 0) View.VISIBLE else View.GONE
         dlFab.text = if (bc > 1) "⬇ تحميل الفيديو ($bc)" else "⬇ تحميل الفيديو"
+        dlActions.visibility = if (n > 0 || bc > 0) View.VISIBLE else View.GONE
         val act = activeBox.childCount
-        activeTitle.text = if (act > 0) "جارٍ التحميل الآن ($act)" else "جارٍ التحميل الآن"
-        activeEmpty.visibility = if (act > 0) View.GONE else View.VISIBLE
         navItems[1].second.text = if (act > 0) "جارٍ ($act)" else if (n > 0) "التحميلات ($n)" else "التحميلات"
-        emptyTv.visibility = if (n > 0) View.GONE else View.VISIBLE
+
+        // فلترة الصفوف وتحديث الأقسام
+        val rows = allRows()
+        val cnt = IntArray(5)
+        for (r in rows) {
+            cnt[0]++
+            when (r.state) {
+                1, 2 -> cnt[1]++
+                3 -> cnt[2]++
+                0 -> cnt[3]++
+                4 -> cnt[4]++
+            }
+        }
+        val names = arrayOf("الكل", "جارية", "مكتملة", "ملتقطة", "غير مكتملة")
+        for (i in dlChips.indices) {
+            dlChips[i].text = names[i] + " (" + cnt[i] + ")"
+            styleChip(dlChips[i], i == dlFilter)
+        }
+        var visAct = 0
+        var visList = 0
+        for (r in rows) {
+            val show = inFilter(r)
+            r.view.visibility = if (show) View.VISIBLE else View.GONE
+            if (show) { if (r.view.parent === activeBox) visAct++ else visList++ }
+        }
+        activeTitle.text = "جارٍ التحميل الآن ($visAct)"
+        activeTitle.visibility = if (visAct > 0) View.VISIBLE else View.GONE
+        listTitle.visibility = if (visList > 0) View.VISIBLE else View.GONE
+        val none = visAct + visList == 0
+        emptyTv.visibility = if (none) View.VISIBLE else View.GONE
+        emptyTv.text = when {
+            rows.isEmpty() -> "لا توجد روابط ملتقطة بعد"
+            dlFilter == 1 -> "لا توجد تحميلات جارية"
+            dlFilter == 2 -> "لا توجد تحميلات مكتملة"
+            dlFilter == 3 -> "لا توجد فيديوهات ملتقطة بانتظار التحميل"
+            dlFilter == 4 -> "لا توجد تحميلات غير مكتملة"
+            else -> "لا توجد روابط ملتقطة بعد"
+        }
         if (navItems.size > 4) navItems[4].second.text = if (alerts.isNotEmpty()) "التنبيهات (" + alerts.size + ")" else "التنبيهات"
         alertEmpty.visibility = if (alerts.isNotEmpty()) View.GONE else View.VISIBLE
     }
@@ -4197,6 +4569,7 @@ deep();
             ctl.paused = !ctl.paused
             pauseB.text = if (ctl.paused) "استئناف" else "إيقاف مؤقت"
             msg.text = if (ctl.paused) "متوقف مؤقتاً" else "جاري التحميل..."
+            cands[u]?.rw?.let { setState(it, if (ctl.paused) 2 else 1) }
         }
         cancelB.setOnClickListener {
             ctl.cancelled = true
@@ -4218,28 +4591,46 @@ deep();
         val watchB = pill("▶ مشاهدة", false) { watchRow(rw) }
         watchB.visibility = View.GONE
         rw.watch = watchB
+        val delB = pill("🗑 حذف", false) { cands[u]?.let { deleteDialog(it) } }
+        val classB = pill("تصنيف", false) { cands[u]?.let { classifyDialog(it) } }
+
+        // السطر الأول: اسم الفيديو وحالته
+        val trow = LinearLayout(this)
+        trow.orientation = LinearLayout.HORIZONTAL
+        trow.gravity = Gravity.CENTER_VERTICAL
+        val chip = tv("ملتقط", 11f, cMuted, true)
+        chip.setPadding(dp(10), dp(3), dp(10), dp(3))
+        chip.background = bg(Color.TRANSPARENT, 10, cMuted)
+        rw.chip = chip
+        trow.addView(title, lp(0, WRAP, 1f, 0, 0, 8, 0))
+        trow.addView(chip, lp(WRAP, WRAP))
+
+        // أزرار التحميل (أساسية) ثم أزرار الأدوات (ثانوية)
         val btns = LinearLayout(this)
         btns.orientation = LinearLayout.HORIZONTAL
-        btns.addView(btn, lp(WRAP, WRAP, 0f, 0, 0, 8, 0))
-        btns.addView(copy)
-        btns.addView(watchB, lp(WRAP, WRAP, 0f, 8, 0, 0, 0))
-        btns.addView(pauseB, lp(WRAP, WRAP, 0f, 8, 0, 0, 0))
-        btns.addView(cancelB, lp(WRAP, WRAP, 0f, 8, 0, 0, 0))
-
-        row.addView(title)
-        row.addView(host)
-        row.addView(btns, lp(MATCH, WRAP, 0f, 0, 8, 0, 0))
+        btns.addView(btn, lp(0, WRAP, 1f, 0, 0, 6, 0))
+        btns.addView(pauseB, lp(0, WRAP, 1f, 0, 0, 6, 0))
+        btns.addView(cancelB, lp(0, WRAP, 1f))
         val btns2 = LinearLayout(this)
         btns2.orientation = LinearLayout.HORIZONTAL
-        btns2.addView(pill("تصنيف: مسجل / مباشر", false) { cands[u]?.let { classifyDialog(it) } })
+        btns2.addView(watchB, lp(0, WRAP, 1f, 0, 0, 6, 0))
+        btns2.addView(copy, lp(0, WRAP, 1f, 0, 0, 6, 0))
+        btns2.addView(classB, lp(0, WRAP, 1f, 0, 0, 6, 0))
+        btns2.addView(delB, lp(0, WRAP, 1f))
+
+        row.addView(trow)
+        row.addView(host)
+        row.addView(bar, lp(MATCH, WRAP, 0f, 0, 6, 0, 0))
+        row.addView(msg, lp(MATCH, WRAP, 0f, 0, 2, 0, 0))
+        row.addView(btns, lp(MATCH, WRAP, 0f, 0, 8, 0, 0))
         row.addView(btns2, lp(MATCH, WRAP, 0f, 0, 6, 0, 0))
-        row.addView(bar, lp(MATCH, WRAP, 0f, 0, 8, 0, 0))
-        row.addView(msg, lp(MATCH, WRAP, 0f, 0, 4, 0, 0))
+        row.tag = rw
         list.addView(row, 0, lp(MATCH, WRAP, 0f, 0, 0, 0, 10))
         updateCounts()
     }
 
     private fun enqueue(u: String, h: Map<String, String>, r: Row) {
+        if (r.removed) return
         val ctl = r.ctl
         ctl.cancelled = false
         ctl.paused = false
@@ -4248,6 +4639,7 @@ deep();
         r.cancel.visibility = View.VISIBLE
         ctl.bytes.set(0)
         setActive(r, true)
+        setState(r, 1)
         val t0 = System.currentTimeMillis()
         var lastT = t0
         var lastB = 0L
@@ -4275,10 +4667,6 @@ deep();
                     sb.append("\n").append("مضى ").append(fmtTime(el))
                     if (frac > 0.02) sb.append("  •  متبقي ").append(fmtTime((el * (1 - frac) / frac).toLong()))
                     r.msg.text = sb.toString()
-                    if (page == 0) {
-                        badge.visibility = View.VISIBLE
-                        badge.text = "⬇ " + pc + "%"
-                    }
                 }
             }
         }
@@ -4312,13 +4700,19 @@ deep();
                 result = saved.first
                 r.finalLoc = saved.second
                 r.finalIsUri = saved.second.startsWith("content:")
-                ui.post { r.msg.text = "تم: $result"; r.bar.progress = r.bar.max; r.watch?.visibility = View.VISIBLE }
+                ui.post {
+                    r.msg.text = "تم: $result"
+                    r.bar.progress = r.bar.max
+                    r.watch?.visibility = View.VISIBLE
+                    if (!r.removed) setState(r, 3)
+                }
             } catch (e: CancelledException) {
                 ui.post {
                     r.msg.text = "أُلغي التحميل"
                     r.btn.isEnabled = true
                     r.btn.alpha = 1f
                     r.bar.visibility = View.GONE
+                    if (!r.removed) setState(r, 4)
                 }
             } catch (e: Throwable) {
                 keep = true
@@ -4327,6 +4721,7 @@ deep();
                     r.msg.text = "فشل: " + (e.message ?: e.javaClass.simpleName) + " (اضغط تحميل للإكمال من حيث توقف)"
                     r.btn.isEnabled = true
                     r.btn.alpha = 1f
+                    if (!r.removed) setState(r, 4)
                 }
             } finally {
                 if (!keep) work.deleteRecursively()
