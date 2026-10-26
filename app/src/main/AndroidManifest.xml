@@ -39,5 +39,8 @@
                 <data android:mimeType="application/xhtml+xml"/>
             </intent-filter>
         </activity>
+        <activity android:name=".VideoPlayerActivity" android:exported="false"
+            android:theme="@android:style/Theme.Black.NoTitleBar.Fullscreen"
+            android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|keyboardHidden|keyboard|uiMode|density|fontScale|locale|layoutDirection"/>
     </application>
 </manifest>

@@ -11,6 +11,7 @@ import android.content.Intent
 import android.content.res.ColorStateList
 import android.graphics.Color
 import android.graphics.Typeface
+import android.graphics.drawable.ColorDrawable
 import android.graphics.drawable.GradientDrawable
 import android.media.MediaCodec
 import android.media.MediaExtractor
@@ -114,6 +115,13 @@ class MainActivity : Activity() {
     private lateinit var barBack: ImageView
     private lateinit var barFwd: ImageView
     private lateinit var barTabs: FrameLayout
+    private lateinit var barMenu: ImageView
+    private lateinit var barPlus: ImageView
+    private lateinit var barDl: ImageView
+    private lateinit var barBatch: ImageView
+    private lateinit var barHome: ImageView
+    private lateinit var navOverlay: FrameLayout
+    private lateinit var navPopup: LinearLayout
 
     @Volatile private var adBlock = true
     @Volatile private var curUa = ""
@@ -296,6 +304,7 @@ class MainActivity : Activity() {
         val bytes = java.util.concurrent.atomic.AtomicLong(0)
     }
     private class CancelledException : Exception("أُلغي التحميل")
+    private class ProtectedException(m: String) : Exception(m)
     private class Row(val bar: ProgressBar, val msg: TextView, val btn: View, val pause: TextView, val cancel: TextView, val ctl: Ctl, val view: View) {
         var work: File? = null
         var finalLoc: String? = null
@@ -305,6 +314,26 @@ class MainActivity : Activity() {
         var state = 0
         var removed = false
         var chip: TextView? = null
+        // فيديو محمي رُفض تحميله: زر المشاهدة يجرّب تشغيله مباشرة بالمشغّل المدمج
+        var protectedStream = false
+        var srcUrl: String? = null
+        var srcHdr: Map<String, String>? = null
+        // معرّف العنصر المحمي المحفوظ للتشغيل دون اتصال (إن وُجد)
+        var offlineId: String? = null
+        // الصورة المصغّرة وحالة الحماية والصيغة المعروضة بجانب العنصر
+        var thumb: ImageView? = null
+        var thumbSet = false
+        var kindTv: TextView? = null
+        var kindProt = 2
+        var kindFmt = ""
+        // هوية المهمة (من الرابط كاملاً) وبياناتها المستقلة المحفوظة
+        var url = ""
+        var id = ""
+        var created = System.currentTimeMillis()
+        var engine = 0
+        var quiet = false
+        // عنوان الصفحة التي التُقط منها الفيديو، لإعادة فتحها والالتقاط من جديد عند انتهاء صلاحية الرابط
+        var pageUrl = ""
     }
 
     // يوقف الخيط أثناء الإيقاف المؤقت ويرمي استثناء عند الإلغاء
@@ -376,6 +405,8 @@ class MainActivity : Activity() {
         var startBack = false
         var popup = false
         var scanning = false
+        var icon: android.graphics.Bitmap? = null
+        var thumb: android.graphics.Bitmap? = null
     }
 
     // ---------- أدوات مساعدة للواجهة ----------
@@ -485,6 +516,8 @@ class MainActivity : Activity() {
     override fun onCreate(b: Bundle?) {
         super.onCreate(b)
         applyPools()
+        try { File(cacheDir, "live_preview").deleteRecursively() } catch (e: Throwable) {}
+        PlayerCore.liveHook = { key, lastSig -> liveSnapshot(key, lastSig) }
         val prevH = Thread.getDefaultUncaughtExceptionHandler()
         Thread.setDefaultUncaughtExceptionHandler { th, e ->
             try {
@@ -527,11 +560,26 @@ class MainActivity : Activity() {
         for (p in pagesList) pageHost.addView(p, FrameLayout.LayoutParams(MATCH, MATCH))
 
         root.addView(pageHost, lp(MATCH, 0, 1f))
-        root.addView(buildNav(), lp(MATCH, WRAP))
-        setContentView(root)
+        val frame = FrameLayout(this)
+        frame.layoutDirection = View.LAYOUT_DIRECTION_LTR
+        frame.addView(root, FrameLayout.LayoutParams(MATCH, MATCH))
+        navOverlay = FrameLayout(this)
+        navOverlay.visibility = View.GONE
+        val scrim = View(this)
+        scrim.setBackgroundColor(Color.parseColor("#66000000"))
+        scrim.setOnClickListener { closeNavMenu() }
+        navOverlay.addView(scrim, FrameLayout.LayoutParams(MATCH, MATCH))
+        navOverlay.addView(buildNav(), navPopupLp())
+        frame.addView(navOverlay, FrameLayout.LayoutParams(MATCH, MATCH))
+        frame.addView(buildSwitcher(), FrameLayout.LayoutParams(MATCH, MATCH))
+        val snLp = FrameLayout.LayoutParams(MATCH, WRAP, Gravity.BOTTOM)
+        snLp.setMargins(dp(12), 0, dp(12), dp(14))
+        frame.addView(swSnack, snLp)
+        setContentView(frame)
         loadAlerts()
         loadClosed()
         cleanOldWork()
+        restoreTasks()
 
         if (Build.VERSION.SDK_INT in 23..28 &&
             checkSelfPermission(android.Manifest.permission.WRITE_EXTERNAL_STORAGE) != android.content.pm.PackageManager.PERMISSION_GRANTED) {
@@ -593,6 +641,8 @@ class MainActivity : Activity() {
 
     override fun onDestroy() {
         ui.removeCallbacksAndMessages(null)
+        for (c in swClosed) try { c.t.web.destroy() } catch (e: Throwable) {}
+        swClosed.clear()
         for (t in ArrayList(tabs)) {
             try { container.removeView(t.web) } catch (e: Throwable) {}
             try { t.web.destroy() } catch (e: Throwable) {}
@@ -634,6 +684,18 @@ class MainActivity : Activity() {
     }
 
     override fun onBackPressed() {
+        if (swMenu.visibility == View.VISIBLE) {
+            swMenu.visibility = View.GONE
+            return
+        }
+        if (swShown) {
+            if (swSelMode) swEndSel() else closeSw()
+            return
+        }
+        if (navOverlay.visibility == View.VISIBLE) {
+            closeNavMenu()
+            return
+        }
         if (fullView != null) {
             hideFull()
             return
@@ -662,17 +724,56 @@ class MainActivity : Activity() {
         }
     }
 
-    // ---------- البناء: الشريط السفلي والصفحات ----------
+    // ---------- البناء: القائمة الجانبية والصفحات ----------
 
+    private fun navPopupLp(): FrameLayout.LayoutParams {
+        val p = FrameLayout.LayoutParams(WRAP, WRAP, Gravity.TOP or Gravity.LEFT)
+        p.topMargin = dp(52)
+        p.leftMargin = dp(8)
+        return p
+    }
+
+    private fun openNavMenu() {
+        hideKb()
+        navOverlay.visibility = View.VISIBLE
+    }
+
+    private fun closeNavMenu() {
+        navOverlay.visibility = View.GONE
+    }
+
+    // تحديث الصفحة، أو إيقاف تحميلها إن كانت تُحمَّل الآن
+    private fun reloadOrStop() {
+        val t = cur
+        if (t != null) {
+            if (t.loading && t.progress < 100) {
+                t.web.stopLoading()
+                t.loading = false
+                updateLoadUi()
+            } else {
+                hardReload(t)
+            }
+        }
+    }
+
+    // القائمة الجانبية الصغيرة: أيقونات مع أسمائها، تظهر تحت زر الثلاث نقاط
     private fun buildNav(): View {
-        val wrap = LinearLayout(this)
-        wrap.orientation = LinearLayout.VERTICAL
-        val line = View(this)
-        line.setBackgroundColor(cLine)
-        wrap.addView(line, lp(MATCH, 1))
-        val row = LinearLayout(this)
-        row.orientation = LinearLayout.HORIZONTAL
-        row.setBackgroundColor(cBar)
+        val col = LinearLayout(this)
+        col.orientation = LinearLayout.VERTICAL
+        col.background = bg(cBar, 16, cLine)
+        col.setPadding(dp(6), dp(6), dp(6), dp(6))
+        col.elevation = dp(8).toFloat()
+        // زر × لإغلاق القائمة
+        val cl = FrameLayout(this)
+        cl.minimumWidth = dp(76)
+        val cim = ImageView(this)
+        cim.setImageResource(R.drawable.ic_close)
+        cim.setColorFilter(cMuted)
+        cim.setPadding(dp(8), dp(8), dp(8), dp(8))
+        cim.contentDescription = "إغلاق"
+        cl.addView(cim, FrameLayout.LayoutParams(dp(40), dp(40), Gravity.CENTER))
+        cl.setOnClickListener { closeNavMenu() }
+        col.addView(cl, lp(MATCH, dp(40)))
         val defs = listOf(
             Triple(R.drawable.ic_home, "المتصفح", 0),
             Triple(R.drawable.ic_download, "التحميلات", 1),
@@ -687,20 +788,46 @@ class MainActivity : Activity() {
             val item = LinearLayout(this)
             item.orientation = LinearLayout.VERTICAL
             item.gravity = Gravity.CENTER
+            item.minimumWidth = dp(76)
             item.minimumHeight = dp(54 * pb / 100)
-            item.setPadding(0, dp(7 * pb / 100), 0, dp(7 * pb / 100))
+            item.setPadding(dp(4), dp(7 * pb / 100), dp(4), dp(7 * pb / 100))
             val im = ImageView(this)
             im.setImageResource(ic)
             val t = tv(label, (11f * pb / 100f).coerceIn(7f, 16f), cMuted)
-            val isz = minOf(dp(24 * pi / 100), resources.displayMetrics.widthPixels / 5 - dp(4))
+            t.gravity = Gravity.CENTER
+            val isz = dp(24 * pi / 100)
             item.addView(im, lp(isz, isz))
             item.addView(t, lp(WRAP, WRAP, 0f, 0, 2, 0, 0))
-            item.setOnClickListener { if (idx == 3 && page == 3 && setSub.isNotEmpty()) openSettingsSub("") else showPage(idx) }
-            row.addView(item, lp(0, WRAP, 1f))
+            item.setOnClickListener {
+                closeNavMenu()
+                if (idx == 3 && page == 3 && setSub.isNotEmpty()) openSettingsSub("") else showPage(idx)
+            }
+            // «المتصفح» غير ظاهر في القائمة لأن زر الرئيسية في الشريط العلوي، لكنه يبقى في القائمة الداخلية لتلوين الصفحة الحالية
+            if (idx != 0) col.addView(item, lp(MATCH, WRAP))
             navItems.add(Pair(im, t))
         }
-        wrap.addView(row, lp(MATCH, WRAP))
-        return wrap
+        // تحديث الصفحة
+        val rf = LinearLayout(this)
+        rf.orientation = LinearLayout.VERTICAL
+        rf.gravity = Gravity.CENTER
+        rf.minimumWidth = dp(76)
+        rf.minimumHeight = dp(54)
+        rf.setPadding(dp(4), dp(7), dp(4), dp(7))
+        val rim = ImageView(this)
+        rim.setImageResource(R.drawable.ic_refresh)
+        rim.setColorFilter(cMuted)
+        val rt = tv("تحديث الصفحة", 11f, cMuted)
+        rt.gravity = Gravity.CENTER
+        rf.addView(rim, lp(dp(24), dp(24)))
+        rf.addView(rt, lp(WRAP, WRAP, 0f, 0, 2, 0, 0))
+        rf.setOnClickListener {
+            closeNavMenu()
+            showPage(0)
+            reloadOrStop()
+        }
+        col.addView(rf, lp(MATCH, WRAP))
+        navPopup = col
+        return col
     }
 
     private fun showPage(i: Int) {
@@ -726,10 +853,13 @@ class MainActivity : Activity() {
         bar.gravity = Gravity.CENTER_VERTICAL
         bar.setBackgroundColor(cBar)
         bar.setPadding(dp(6), dp(6), dp(6), dp(6))
+        bar.layoutDirection = View.LAYOUT_DIRECTION_LTR
+        // الرجوع والتقدم والتحديث لم تعد في الشريط (الرجوع بزر الهاتف، والتحديث من القائمة)؛ تبقى مُنشأة غير ظاهرة لأن بقية الكود يشير إليها
         barBack = iconBtn(R.drawable.ic_back) { cur?.let { backInTab(it) } }
-        bar.addView(barBack, lp(dp(38), dp(38)))
         barFwd = iconBtn(R.drawable.ic_forward) { cur?.web?.let { if (it.canGoForward()) it.goForward() } }
-        bar.addView(barFwd, lp(dp(38), dp(38)))
+        barMenu = iconBtn(R.drawable.ic_more) { openNavMenu() }
+        barMenu.contentDescription = "القائمة"
+        bar.addView(barMenu, lp(dp(38), dp(38)))
 
         urlBox = EditText(this)
         urlBox.setTextColor(cText)
@@ -771,28 +901,32 @@ class MainActivity : Activity() {
             tabFrame.foreground = resources.getDrawable(rv.resourceId, theme)
         }
         tabFrame.isClickable = true
-        tabFrame.setOnClickListener { showTabs() }
+        tabFrame.setOnClickListener { openSw() }
         barTabs = tabFrame
-        bar.addView(tabFrame, lp(dp(38), dp(38), 0f, 0, 0, 0, 0))
+        bar.addView(tabFrame, 1, lp(dp(38), dp(38), 0f, 0, 0, 0, 0))
+        barPlus = iconBtn(R.drawable.ic_add) { newHomeTab() }
+        barPlus.contentDescription = "تبويب جديد"
+        bar.addView(barPlus, 2, lp(dp(38), dp(38)))
 
         pct = tv("", 11f, cAccent, true)
         pct.visibility = View.GONE
         bar.addView(pct, lp(WRAP, WRAP, 0f, 0, 0, 2, 0))
 
-        reloadBtn = iconBtn(R.drawable.ic_refresh) {
-            val t = cur
-            if (t != null) {
-                if (t.loading && t.progress < 100) {
-                    t.web.stopLoading()
-                    t.loading = false
-                    updateLoadUi()
-                } else {
-                    hardReload(t)
-                }
-            }
+        reloadBtn = iconBtn(R.drawable.ic_refresh) { reloadOrStop() }
+        barDl = iconBtn(R.drawable.ic_download, cAccent) { showPage(1) }
+        barDl.contentDescription = "تحميل الفيديو"
+        bar.addView(barDl, lp(dp(38), dp(38)))
+        barBatch = iconBtn(R.drawable.ic_batch) { capturePage() }
+        barBatch.contentDescription = "التقاط كل فيديوهات الصفحة"
+        bar.addView(barBatch, lp(dp(38), dp(38)))
+        barHome = iconBtn(R.drawable.ic_home_solid) {
+            cur?.start = true
+            cur?.startBack = cur?.web?.url != null
+            updateStart()
+            showPage(0)
         }
-        bar.addView(reloadBtn, lp(dp(38), dp(38)))
-        bar.addView(iconBtn(R.drawable.ic_batch) { capturePage() }, lp(dp(38), dp(38)))
+        barHome.contentDescription = "الرئيسية"
+        bar.addView(barHome, lp(dp(38), dp(38)))
         col.addView(bar, lp(MATCH, WRAP))
 
         // شريط تقدّم تحميل الصفحة
@@ -841,6 +975,8 @@ class MainActivity : Activity() {
         head.orientation = LinearLayout.HORIZONTAL
         head.gravity = Gravity.CENTER_VERTICAL
         head.addView(tv("التحميلات", 20f, cText, true), lp(0, WRAP, 1f))
+        head.addView(pill("الصور", false) { showImagesSection() }, lp(WRAP, WRAP, 0f, 0, 0, 6, 0))
+        head.addView(pill("المحمية", false) { showOfflineManager() }, lp(WRAP, WRAP, 0f, 0, 0, 6, 0))
         head.addView(pill("المخزن", true) { openStorage() }, lp(WRAP, WRAP, 0f, 0, 0, 6, 0))
         head.addView(pill("مسح القائمة", false) { clearFound() })
         col.addView(head, lp(MATCH, WRAP, 0f, 0, 0, 0, 6))
@@ -949,6 +1085,7 @@ class MainActivity : Activity() {
             it.background = bg(Color.TRANSPARENT, 10, c)
         }
         updateCounts()
+        saveTask(r)
     }
 
     // حذف تحميل: يوقفه إن كان يعمل ويحذف أجزاءه المؤقتة ويزيله من القائمة (الملف المحفوظ في التحميلات لا يُمس)
@@ -963,6 +1100,7 @@ class MainActivity : Activity() {
             r.work = null
         }
         (r.view.parent as? ViewGroup)?.removeView(r.view)
+        forgetTask(r.id)
         found.remove(c.url)
         foundStart.remove(c.url)
         foundHdr.remove(c.url)
@@ -1052,13 +1190,6 @@ class MainActivity : Activity() {
 
         section(col, "التصفح")
         grid(col, listOf(
-            toolCard(R.drawable.ic_add, "تبويب جديد") { newHomeTab() },
-            toolCard(R.drawable.ic_home_solid, "الرئيسية") {
-                cur?.start = true
-                cur?.startBack = cur?.web?.url != null
-                updateStart()
-                showPage(0)
-            },
             toolCard(R.drawable.ic_search, "بحث بالصفحة") { openFind() },
             toolCard(R.drawable.ic_up, "أعلى الصفحة") { cur?.web?.pageUp(true); showPage(0) },
             toolCard(R.drawable.ic_down, "أسفل الصفحة") { cur?.web?.pageDown(true); showPage(0) },
@@ -1082,7 +1213,6 @@ class MainActivity : Activity() {
                 }
             },
             toolCard(R.drawable.ic_star, "إضافة للمفضلة") { addBookmark() },
-            toolCard(R.drawable.ic_bookmark, "المفضلة") { showBookmarks() },
             toolCard(R.drawable.ic_pin, "إضافة اختصار") {
                 val c = cur
                 val u = c?.web?.url
@@ -1093,16 +1223,12 @@ class MainActivity : Activity() {
 
         section(col, "التبويبات والسجل")
         grid(col, listOf(
-            toolCard(R.drawable.ic_tabs, "ترتيب التبويبات") { showTabs() },
             toolCard(R.drawable.ic_undo, "المغلقة مؤخراً") { showClosed() },
-            toolCard(R.drawable.ic_close, "إغلاق الأخرى") { closeOthers() },
-            toolCard(R.drawable.ic_list, "روابط التبويبات") { copyTabs() },
-            toolCard(R.drawable.ic_history, "سجل التصفح") { showHistory() }
+            toolCard(R.drawable.ic_list, "روابط التبويبات") { copyTabs() }
         ))
 
         section(col, "التحميلات والملفات")
         grid(col, listOf(
-            toolCard(R.drawable.ic_download, "تحميل من الحافظة") { downloadFromClip() },
             toolCard(R.drawable.ic_batch, "تحميل دفعة روابط") { batchLinks() },
             toolCard(R.drawable.ic_copy, "نسخ روابط الفيديو") { copyFound() },
             toolCard(R.drawable.ic_send, "مشاركة الروابط") { shareFound() },
@@ -1120,7 +1246,6 @@ class MainActivity : Activity() {
         section(col, "التقاط الفيديو")
         grid(col, listOf(
             toolCard(R.drawable.ic_search_link, "فحص رابط") { inspectLink() },
-            toolCard(R.drawable.ic_batch, "التقاط كل فيديوهات الصفحة") { capturePage() },
             toolCard(R.drawable.ic_list, "سجل الالتقاط") { showCapLog() },
             toolCard(R.drawable.ic_search_link, "الروابط المستبعدة") { excludedDialog() }
         ))
@@ -1389,7 +1514,7 @@ class MainActivity : Activity() {
     private fun buildSetNet(col: LinearLayout) {
         section(col, "التحميل")
         val g3 = settingsCard(col)
-        switchRow(g3, "محاولة التحميل رغم علامة DRM", "الأصل: مغلق. فك تشفير DRM غير ممكن، فالمحاولة تحفظ بيانات مشفّرة غالباً لا تعمل. تفعيله يلغي الرفض ويترك لك القرار", "ignoredrm", false) { }
+        switchRow(g3, "محاولة التحميل رغم علامة DRM", "الأصل: مغلق. فك تشفير DRM غير ممكن، فالمحاولة تحفظ بيانات مشفّرة غالباً لا تعمل. الحفظ الرسمي دون اتصال (ترخيص المنصة) يعمل تلقائياً دون هذا الخيار ويظهر في «المحمية»", "ignoredrm", false) { }
         switchRow(g3, "تحميل خام عند تشفير HLS غير مدعوم", "التطبيق يفك AES-128 فقط. عند أي تشفير آخر مثل SAMPLE-AES يرفض افتراضياً. تفعيله يحمّل الأجزاء كما هي بدون فك", "ignoreenc", false) { }
         val cnt = tv("" + prefs().getInt("threads", 8), 16f, cText, true)
         cnt.gravity = Gravity.CENTER
@@ -1634,7 +1759,6 @@ class MainActivity : Activity() {
         h1.orientation = LinearLayout.HORIZONTAL
         h1.gravity = Gravity.CENTER_VERTICAL
         h1.addView(tv("المواقع", 15f, cText, true), lp(0, WRAP, 1f))
-        h1.addView(pill("+ إضافة", false) { addShortcutDialog() })
         col.addView(h1, lp(MATCH, WRAP, 0f, 0, 22, 0, 6))
         startSites = LinearLayout(this)
         startSites.orientation = LinearLayout.VERTICAL
@@ -1996,6 +2120,17 @@ class MainActivity : Activity() {
                 if (cur === t) updateLoadUi()
             }
 
+            override fun onReceivedIcon(v: WebView, icon: android.graphics.Bitmap?) {
+                val t = hasTab(v) ?: return
+                if (icon == null) return
+                t.icon = icon
+                val h = try { Uri.parse(v.url ?: "").host } catch (e: Throwable) { null }
+                if (h != null) {
+                    val old = favCache[h]
+                    if (old == null || icon.width >= old.width) favCache[h] = icon
+                }
+            }
+
             override fun onReceivedTitle(v: WebView, title: String?) {
                 val t = hasTab(v) ?: return
                 t.title = title ?: ""
@@ -2313,107 +2448,727 @@ class MainActivity : Activity() {
         relabel()
     }
 
-    // مدير التبويبات: اسحب بالضغط المطول لتغيير المكان بحرية، أو استخدم الأسهم
-    private fun showTabs() {
-        val box = LinearLayout(this)
-        box.orientation = LinearLayout.VERTICAL
-        box.layoutDirection = View.LAYOUT_DIRECTION_RTL
-        box.setPadding(dp(10), dp(6), dp(10), dp(6))
-        val sv = ScrollView(this)
-        sv.addView(box)
-        val dlgRef = arrayOfNulls<AlertDialog>(1)
+    // ================= شاشة التبويبات (النمط الجديد) =================
 
-        fun fill() {
-            box.removeAllViews()
-            dlgRef[0]?.setTitle("التبويبات (" + tabs.size + ")")
-            box.addView(tv("اضغط مطولاً على تبويب ثم اسحبه لتغيير مكانه", 12f, cMuted), lp(MATCH, WRAP, 0f, 0, 0, 0, 8))
-            for (i in tabs.indices) {
-                val t = tabs[i]
-                val row = LinearLayout(this)
-                row.orientation = LinearLayout.HORIZONTAL
-                row.gravity = Gravity.CENTER_VERTICAL
-                row.background = bg(if (t === cur) cAccentSoft else cCard, 12, if (t === cur) cAccent else cLine)
-                row.setPadding(dp(10), dp(6), dp(6), dp(6))
-                val handle = tv("☰", 16f, cMuted, true)
-                handle.setPadding(0, 0, dp(10), 0)
-                val title = tv(
-                    (if (t.title.isNotBlank()) t.title else (t.web.url ?: ("تبويب " + (i + 1)))).take(50),
-                    14f, cText, t === cur
-                )
-                title.maxLines = 1
-                title.ellipsize = TextUtils.TruncateAt.END
-                title.setOnClickListener {
-                    dlgRef[0]?.dismiss()
-                    switchTo(t)
-                    showPage(0)
+    private class SwClosed(val t: Tab, val i: Int)
+
+    private lateinit var swRoot: FrameLayout
+    private lateinit var swCount: TextView
+    private lateinit var swQuery: EditText
+    private lateinit var swHint: TextView
+    private lateinit var swScroll: ScrollView
+    private lateinit var swList: LinearLayout
+    private lateinit var swSelBar: LinearLayout
+    private lateinit var swDel: TextView
+    private lateinit var swAll: TextView
+    private lateinit var swMenu: LinearLayout
+    private lateinit var swMenuBtn: TextView
+    private lateinit var swSnack: LinearLayout
+    private lateinit var swSnackTxt: TextView
+    private lateinit var swSnackBtn: TextView
+    private var swShown = false
+    private var swSelMode = false
+    private var swDragging = false
+    private val swSel = HashSet<Tab>()
+    private val swClosed = ArrayList<SwClosed>()
+    private val swCells = ArrayList<Pair<View, Int>>()
+    private val swTg = HashMap<Int, View>()
+    private val swHideSnack = Runnable {
+        swSnack.visibility = View.GONE
+        swFinalize()
+    }
+    private val favCache = java.util.concurrent.ConcurrentHashMap<String, android.graphics.Bitmap>()
+    private val SW_HINT = "اضغط مطولاً على أي بطاقة ثم اسحبها فوق بطاقة أخرى لتغيير الترتيب"
+
+    private fun swC2() = Color.parseColor(if (dark) "#2B2E33" else "#E6EAF0")
+    private fun swCs() = Color.parseColor(if (dark) "#A8C7FA" else "#CFE0FB")
+    private fun swOns() = Color.parseColor("#0B1B33")
+    private fun swOnAcc() = Color.parseColor(if (dark) "#0B1B33" else "#FFFFFF")
+    private fun swAcc() = Color.parseColor(if (dark) "#5B9BFF" else "#2F6FE0")
+
+    private fun nAr(n: Int): String {
+        val sb = StringBuilder()
+        for (ch in n.toString()) sb.append(if (ch in '0'..'9') ('٠' + (ch - '0')) else ch)
+        return sb.toString()
+    }
+
+    private fun swGd(color: Int, r: Int, sw: Int = 0, sc: Int = 0): GradientDrawable {
+        val g = GradientDrawable()
+        g.setColor(color)
+        g.cornerRadius = dp(r).toFloat()
+        if (sw > 0) g.setStroke(dp(sw), sc)
+        return g
+    }
+
+    private fun swOval(color: Int): GradientDrawable {
+        val g = GradientDrawable()
+        g.shape = GradientDrawable.OVAL
+        g.setColor(color)
+        return g
+    }
+
+    private fun swPress(normal: android.graphics.drawable.Drawable, pressed: Int, r: Int, oval: Boolean = false): android.graphics.drawable.StateListDrawable {
+        val s = android.graphics.drawable.StateListDrawable()
+        val p = GradientDrawable()
+        p.setColor(pressed)
+        if (oval) p.shape = GradientDrawable.OVAL else p.cornerRadius = dp(r).toFloat()
+        s.addState(intArrayOf(android.R.attr.state_pressed), p)
+        s.addState(intArrayOf(), normal)
+        return s
+    }
+
+    private fun swHit(v: View, x: Float, y: Float): Boolean {
+        val l = IntArray(2)
+        v.getLocationOnScreen(l)
+        return x >= l[0] && x <= l[0] + v.width && y >= l[1] && y <= l[1] + v.height
+    }
+
+    private fun buildSwitcher(): View {
+        swRoot = object : FrameLayout(this@MainActivity) {
+            override fun dispatchTouchEvent(ev: android.view.MotionEvent): Boolean {
+                if (!swShown) return false
+                if (ev.actionMasked == android.view.MotionEvent.ACTION_DOWN && swMenu.visibility == View.VISIBLE) {
+                    if (!swHit(swMenu, ev.rawX, ev.rawY) && !swHit(swMenuBtn, ev.rawX, ev.rawY)) swMenu.visibility = View.GONE
                 }
-                fun small(txt: String, f: () -> Unit): TextView {
-                    val b = tv(txt, 16f, cAccent, true)
-                    b.gravity = Gravity.CENTER
-                    b.setPadding(dp(10), dp(6), dp(10), dp(6))
-                    b.setOnClickListener { f() }
-                    return b
-                }
-                row.addView(handle)
-                row.addView(title, lp(0, WRAP, 1f))
-                row.addView(small("▲") { moveTab(i, i - 1); fill() })
-                row.addView(small("▼") { moveTab(i, i + 1); fill() })
-                row.addView(small("✕") {
-                    val n = tabs.size
-                    closeTab(t)
-                    if (tabs.size != n) fill()
-                })
-                row.setOnLongClickListener { v ->
-                    v.alpha = 0.4f
-                    v.startDragAndDrop(ClipData.newPlainText("tab", "" + i), View.DragShadowBuilder(v), t, 0)
-                    true
-                }
-                box.addView(row, lp(MATCH, WRAP, 0f, 0, 0, 0, 6))
+                return super.dispatchTouchEvent(ev)
             }
         }
+        swRoot.layoutDirection = View.LAYOUT_DIRECTION_RTL
+        swRoot.setBackgroundColor(cBg)
+        swRoot.isClickable = true
+        swRoot.visibility = View.GONE
+        val col = LinearLayout(this)
+        col.orientation = LinearLayout.VERTICAL
+        swRoot.addView(col, FrameLayout.LayoutParams(MATCH, MATCH))
 
-        box.setOnDragListener { _, ev ->
-            when (ev.action) {
-                android.view.DragEvent.ACTION_DRAG_STARTED -> true
-                android.view.DragEvent.ACTION_DRAG_LOCATION -> {
-                    val ly = ev.y - sv.scrollY
-                    if (ly < dp(48)) sv.scrollBy(0, -dp(14))
-                    else if (ly > sv.height - dp(48)) sv.scrollBy(0, dp(14))
+        // الشريط العلوي: + ، العدّاد ، ⋮
+        val top = LinearLayout(this)
+        top.orientation = LinearLayout.HORIZONTAL
+        top.gravity = Gravity.CENTER_VERTICAL
+        top.setPadding(dp(12), dp(10), dp(12), dp(10))
+        val plus = tv("+", 28f, swOnAcc())
+        plus.gravity = Gravity.CENTER
+        plus.includeFontPadding = false
+        plus.background = swPress(swGd(swAcc(), 14), Color.parseColor("#33000000"), 14)
+        plus.setOnClickListener {
+            closeSw()
+            newTab("")
+        }
+        top.addView(plus, lp(dp(44), dp(44)))
+        top.addView(View(this), lp(0, 1, 1f))
+        val pill = LinearLayout(this)
+        pill.orientation = LinearLayout.HORIZONTAL
+        pill.background = swGd(cCard, 16, 1, cLine)
+        pill.setPadding(dp(4), dp(4), dp(4), dp(4))
+        swCount = tv("١", 18f, cText, true)
+        swCount.gravity = Gravity.CENTER
+        swCount.includeFontPadding = false
+        swCount.background = swGd(cLine, 12)
+        pill.addView(swCount, lp(dp(52), dp(36)))
+        top.addView(pill, lp(WRAP, WRAP))
+        top.addView(View(this), lp(0, 1, 1f))
+        swMenuBtn = tv("⋮", 20f, cText)
+        swMenuBtn.gravity = Gravity.CENTER
+        swMenuBtn.includeFontPadding = false
+        swMenuBtn.background = swPress(ColorDrawable(Color.TRANSPARENT), cLine, 12)
+        swMenuBtn.setOnClickListener {
+            swMenu.visibility = if (swMenu.visibility == View.VISIBLE) View.GONE else View.VISIBLE
+        }
+        top.addView(swMenuBtn, lp(dp(38), dp(38)))
+        col.addView(top, lp(MATCH, WRAP))
+
+        // البحث
+        swQuery = EditText(this)
+        swQuery.hint = "البحث في علامات التبويب"
+        swQuery.setHintTextColor(cMuted)
+        swQuery.setTextColor(cText)
+        swQuery.textSize = 15f
+        swQuery.background = swGd(cLine, 22)
+        swQuery.setPadding(dp(18), 0, dp(18), 0)
+        swQuery.isSingleLine = true
+        swQuery.layoutDirection = View.LAYOUT_DIRECTION_RTL
+        swQuery.textDirection = View.TEXT_DIRECTION_RTL
+        swQuery.gravity = Gravity.START or Gravity.CENTER_VERTICAL
+        swQuery.addTextChangedListener(object : TextWatcher {
+            override fun beforeTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) {}
+            override fun onTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) {}
+            override fun afterTextChanged(s: Editable?) {
+                if (swShown) swDraw(false)
+            }
+        })
+        col.addView(swQuery, lp(MATCH, dp(44), 0f, 12, 0, 12, 0))
+
+        swHint = tv(SW_HINT, 12f, cMuted)
+        swHint.textDirection = View.TEXT_DIRECTION_RTL
+        swHint.setPadding(dp(14), dp(8), dp(14), 0)
+        col.addView(swHint, lp(MATCH, WRAP))
+
+        // الشبكة
+        swScroll = ScrollView(this)
+        swScroll.isFillViewport = true
+        swScroll.clipChildren = false
+        swScroll.clipToPadding = false
+        swList = LinearLayout(this)
+        swList.orientation = LinearLayout.VERTICAL
+        swList.clipChildren = false
+        swList.setOnClickListener { if (!swSelMode) closeSw() }
+        swScroll.addView(swList, FrameLayout.LayoutParams(MATCH, MATCH))
+        col.addView(swScroll, lp(MATCH, 0, 1f))
+
+        // شريط التحديد
+        swSelBar = LinearLayout(this)
+        swSelBar.orientation = LinearLayout.VERTICAL
+        swSelBar.setBackgroundColor(cCard)
+        swSelBar.visibility = View.GONE
+        val line = View(this)
+        line.setBackgroundColor(cLine)
+        swSelBar.addView(line, lp(MATCH, dp(1)))
+        val btns = LinearLayout(this)
+        btns.orientation = LinearLayout.HORIZONTAL
+        btns.setPadding(dp(8), dp(10), dp(8), dp(10))
+        fun sbtn(txt: String): TextView {
+            val b = tv(txt, 14f, cText)
+            b.gravity = Gravity.CENTER
+            b.background = swGd(cLine, 14)
+            btns.addView(b, lp(0, dp(44), 1f, 4, 0, 4, 0))
+            return b
+        }
+        val sc = sbtn("إلغاء")
+        swAll = sbtn("تحديد الكل")
+        swDel = sbtn("حذف (٠)")
+        swDel.background = swGd(Color.parseColor("#C62828"), 14)
+        swDel.setTextColor(Color.WHITE)
+        sc.setOnClickListener { swEndSel() }
+        swAll.setOnClickListener {
+            if (swSel.size == tabs.size) swSel.clear() else { swSel.clear(); swSel.addAll(tabs) }
+            swDraw()
+        }
+        swDel.setOnClickListener { swDelSel() }
+        swSelBar.addView(btns, lp(MATCH, WRAP))
+        col.addView(swSelBar, lp(MATCH, WRAP))
+
+        // قائمة ⋮
+        swMenu = LinearLayout(this)
+        swMenu.orientation = LinearLayout.VERTICAL
+        swMenu.background = swGd(cCard, 14, 1, cLine)
+        swMenu.setPadding(dp(6), dp(6), dp(6), dp(6))
+        swMenu.minimumWidth = dp(190)
+        swMenu.elevation = dp(8).toFloat()
+        swMenu.visibility = View.GONE
+        fun mitem(txt: String, f: () -> Unit) {
+            val b = tv(txt, 14f, cText)
+            b.gravity = Gravity.START or Gravity.CENTER_VERTICAL
+            b.textDirection = View.TEXT_DIRECTION_RTL
+            b.setPadding(dp(14), dp(12), dp(14), dp(12))
+            b.background = swPress(ColorDrawable(Color.TRANSPARENT), cLine, 10)
+            b.setOnClickListener {
+                swMenu.visibility = View.GONE
+                f()
+            }
+            swMenu.addView(b, lp(MATCH, WRAP))
+        }
+        mitem("إغلاق الأخرى") { swCloseOthers() }
+        mitem("إغلاق الكل") { swCloseAll() }
+        mitem("تحديد للحذف") { swStartSel() }
+        val mlp = FrameLayout.LayoutParams(WRAP, WRAP, Gravity.TOP or Gravity.LEFT)
+        mlp.topMargin = dp(56)
+        mlp.leftMargin = dp(10)
+        swRoot.addView(swMenu, mlp)
+
+        // شريط «تراجع»
+        swSnack = LinearLayout(this)
+        swSnack.orientation = LinearLayout.HORIZONTAL
+        swSnack.gravity = Gravity.CENTER_VERTICAL
+        swSnack.layoutDirection = View.LAYOUT_DIRECTION_RTL
+        swSnack.background = swGd(Color.parseColor("#E6E8EC"), 14)
+        swSnack.setPadding(dp(14), dp(12), dp(14), dp(12))
+        swSnack.elevation = dp(10).toFloat()
+        swSnack.visibility = View.GONE
+        swSnackTxt = tv("", 14f, Color.parseColor("#14161A"))
+        swSnackTxt.textDirection = View.TEXT_DIRECTION_RTL
+        swSnack.addView(swSnackTxt, lp(0, WRAP, 1f))
+        swSnackBtn = tv("", 14f, Color.parseColor("#1A4A8A"), true)
+        swSnack.addView(swSnackBtn, lp(WRAP, WRAP, 0f, 10, 0, 0, 0))
+        return swRoot
+    }
+
+    private fun swOpen() = swShown
+
+    private fun openSw() {
+        hideKb()
+        closeNavMenu()
+        cur?.let { swCapture(it) }
+        swQuery.setText("")
+        swSelMode = false
+        swSel.clear()
+        swMenu.visibility = View.GONE
+        swDraw(false)
+        swRoot.animate().cancel()
+        swRoot.visibility = View.VISIBLE
+        swRoot.alpha = 0f
+        swRoot.scaleX = 0.93f
+        swRoot.scaleY = 0.93f
+        swRoot.animate().alpha(1f).scaleX(1f).scaleY(1f).setDuration(200).start()
+        swShown = true
+        swScroll.post { swCenterCur() }
+    }
+
+    private fun closeSw() {
+        swSelMode = false
+        swSel.clear()
+        swMenu.visibility = View.GONE
+        hideKb()
+        swShown = false
+        swRoot.animate().cancel()
+        swRoot.animate().alpha(0f).scaleX(0.93f).scaleY(0.93f).setDuration(200)
+            .withEndAction { if (!swShown) swRoot.visibility = View.GONE }.start()
+        if (tabs.isEmpty()) newHomeTab()
+    }
+
+    private fun swCenterCur() {
+        val e = swCells.firstOrNull { tabs.getOrNull(it.second) === cur } ?: return
+        val cell = e.first
+        val row = cell.parent as? View ?: return
+        val y = row.top + cell.top - (swScroll.height - cell.height) / 2
+        swScroll.scrollTo(0, maxOf(0, y))
+    }
+
+    private fun swPick(i: Int) {
+        val t = tabs.getOrNull(i) ?: return
+        closeSw()
+        switchTo(t)
+        showPage(0)
+    }
+
+    private fun swTitle(t: Tab): String {
+        if (t.start) return "تبويب جديد"
+        val u = t.web.url ?: t.pendingUrl ?: return "تبويب جديد"
+        return if (t.title.isNotBlank()) t.title else u.replace(Regex("^https?://"), "")
+    }
+
+    private fun swKey(t: Tab): String {
+        if (t.start) return ""
+        return (t.web.url ?: t.pendingUrl ?: "").replace(Regex("^https?://"), "")
+    }
+
+    private fun swHost(t: Tab): String {
+        if (t.start) return ""
+        return try { Uri.parse(t.web.url ?: t.pendingUrl ?: "").host ?: "" } catch (e: Throwable) { "" }
+    }
+
+    // الدائرة الصغيرة = شعار الموقع المفتوح
+    private fun swFav(t: Tab): View {
+        val fl = FrameLayout(this)
+        val host = swHost(t)
+        val ic = if (host.isEmpty()) null else (favCache[host] ?: t.icon)
+        if (host.isEmpty()) {
+            fl.background = swOval(Color.parseColor("#546E7A"))
+            val x = tv("+", 11f, Color.WHITE)
+            x.gravity = Gravity.CENTER
+            x.includeFontPadding = false
+            fl.addView(x, FrameLayout.LayoutParams(MATCH, MATCH))
+        } else if (ic != null) {
+            fl.background = swOval(Color.WHITE)
+            val iv = ImageView(this)
+            iv.setImageBitmap(ic)
+            iv.scaleType = ImageView.ScaleType.FIT_CENTER
+            iv.setPadding(dp(3), dp(3), dp(3), dp(3))
+            fl.addView(iv, FrameLayout.LayoutParams(MATCH, MATCH))
+        } else {
+            val pal = arrayOf("#6A1B9A", "#C62828", "#455A64", "#EF6C00", "#2E7D32", "#1565C0", "#AD1457")
+            fl.background = swOval(Color.parseColor(pal[(host.hashCode() and 0x7fffffff) % pal.size]))
+            val x = tv(host.removePrefix("www.").take(1).uppercase(), 11f, Color.WHITE)
+            x.gravity = Gravity.CENTER
+            x.includeFontPadding = false
+            fl.addView(x, FrameLayout.LayoutParams(MATCH, MATCH))
+        }
+        return fl
+    }
+
+    private fun swUpdCount() {
+        swCount.text = nAr(tabs.size)
+    }
+
+    private fun swSelUI() {
+        swSelBar.visibility = if (swSelMode) View.VISIBLE else View.GONE
+        swHint.text = if (swSelMode) "اضغط على البطاقات لتحديدها أو إلغاء تحديدها ثم اضغط حذف" else SW_HINT
+        swDel.text = "حذف (" + nAr(swSel.size) + ")"
+        swDel.isEnabled = swSel.isNotEmpty()
+        swDel.alpha = if (swSel.isNotEmpty()) 1f else 0.4f
+        swAll.text = if (tabs.isNotEmpty() && swSel.size == tabs.size) "إلغاء تحديد الكل" else "تحديد الكل"
+    }
+
+    private fun swDraw(keep: Boolean = true) {
+        val sy = swScroll.scrollY
+        swList.removeAllViews()
+        swCells.clear()
+        swTg.clear()
+        val q = swQuery.text.toString().trim()
+        val idx = ArrayList<Int>()
+        for (i in tabs.indices) if (q.isEmpty() || (swTitle(tabs[i]) + swKey(tabs[i])).contains(q, true)) idx.add(i)
+        val a = if (swRoot.width > 0) swRoot.width else resources.displayMetrics.widthPixels
+        val gp = minOf(a * 0.044f, dp(23).toFloat()).toInt()
+        swList.setPadding(gp, gp, gp, 1)
+        if (idx.isEmpty()) {
+            val e = tv(if (tabs.isNotEmpty()) "لا توجد نتائج" else "لا توجد تبويبات مفتوحة", 16f, cMuted)
+            e.gravity = Gravity.CENTER
+            e.setPadding(dp(30), dp(30), dp(30), dp(30))
+            e.setOnClickListener { closeSw() }
+            swList.addView(e, lp(MATCH, WRAP))
+        } else {
+            val cw = (a - 3 * gp) / 2
+            var k = 0
+            while (k < idx.size) {
+                val row = LinearLayout(this)
+                row.orientation = LinearLayout.HORIZONTAL
+                row.layoutDirection = View.LAYOUT_DIRECTION_RTL
+                row.clipChildren = false
+                row.addView(swCard(idx[k], cw), LinearLayout.LayoutParams(cw, WRAP))
+                if (k + 1 < idx.size) {
+                    row.addView(View(this), LinearLayout.LayoutParams(gp, 1))
+                    row.addView(swCard(idx[k + 1], cw), LinearLayout.LayoutParams(cw, WRAP))
+                }
+                val rl = LinearLayout.LayoutParams(MATCH, WRAP)
+                rl.bottomMargin = gp
+                swList.addView(row, rl)
+                k += 2
+            }
+        }
+        swUpdCount()
+        swSelUI()
+        if (keep) swScroll.post { swScroll.scrollTo(0, sy) }
+    }
+
+    private fun swCard(i: Int, cw: Int): View {
+        val t = tabs[i]
+        val isCur = t === cur
+        val sel = swSel.contains(t)
+        val c2 = swC2()
+        val cs = swCs()
+        val ons = swOns()
+        val txt = if (isCur) ons else cText
+        val border = if (isCur && sel) ons else if (sel || isCur) cs else c2
+
+        val cell = FrameLayout(this)
+        cell.clipChildren = false
+        val card = LinearLayout(this)
+        card.orientation = LinearLayout.VERTICAL
+        card.background = swGd(if (isCur) cs else c2, 22, 2, border)
+        card.clipToOutline = true
+        card.setPadding(dp(2), dp(2), dp(2), dp(2))
+
+        val head = LinearLayout(this)
+        head.orientation = LinearLayout.HORIZONTAL
+        head.gravity = Gravity.CENTER_VERTICAL
+        head.setPadding(dp(12), dp(10), dp(12), dp(10))
+        if (swSelMode) {
+            val ck = FrameLayout(this)
+            if (sel) {
+                val fill = if (isCur) ons else cs
+                ck.background = swGd(fill, 11, 2, fill).also { it.shape = GradientDrawable.OVAL }
+                val m = tv("✓", 14f, if (isCur) cs else ons, true)
+                m.gravity = Gravity.CENTER
+                m.includeFontPadding = false
+                ck.addView(m, FrameLayout.LayoutParams(MATCH, MATCH))
+            } else {
+                ck.background = GradientDrawable().also {
+                    it.shape = GradientDrawable.OVAL
+                    it.setColor(Color.TRANSPARENT)
+                    it.setStroke(dp(2), txt)
+                }
+            }
+            val p = LinearLayout.LayoutParams(dp(22), dp(22))
+            p.marginEnd = dp(8)
+            head.addView(ck, p)
+        }
+        val fp = LinearLayout.LayoutParams(dp(22), dp(22))
+        fp.marginEnd = dp(8)
+        head.addView(swFav(t), fp)
+        val tt = tv(swTitle(t), 15f, txt)
+        tt.maxLines = 1
+        tt.ellipsize = TextUtils.TruncateAt.END
+        tt.textDirection = View.TEXT_DIRECTION_RTL
+        tt.gravity = Gravity.START or Gravity.CENTER_VERTICAL
+        val tp = LinearLayout.LayoutParams(0, WRAP, 1f)
+        tp.marginEnd = dp(8)
+        head.addView(tt, tp)
+        if (!swSelMode) {
+            val x = tv("✕", 20f, txt)
+            x.gravity = Gravity.CENTER
+            x.includeFontPadding = false
+            x.background = swPress(ColorDrawable(Color.TRANSPARENT), Color.parseColor("#33000000"), 0, true)
+            x.setOnClickListener { swCloseAt(i) }
+            head.addView(x, LinearLayout.LayoutParams(dp(32), dp(32)))
+        }
+        card.addView(head, lp(MATCH, WRAP))
+
+        // المعاينة المصغّرة للصفحة
+        val thmW = cw - dp(14)
+        val thmH = (thmW * 1.17f).toInt()
+        val thm = FrameLayout(this)
+        val bm = t.thumb
+        thm.background = swGd(if (bm != null) cBg else if (t.start) cBg else Color.WHITE, 17)
+        thm.clipToOutline = true
+        if (bm != null && bm.width > 0) {
+            val iv = ImageView(this)
+            iv.scaleType = ImageView.ScaleType.MATRIX
+            iv.setImageBitmap(bm)
+            val m = android.graphics.Matrix()
+            val s = thmW.toFloat() / bm.width
+            m.setScale(s, s)
+            iv.imageMatrix = m
+            thm.addView(iv, FrameLayout.LayoutParams(MATCH, MATCH))
+        }
+        card.addView(thm, lp(thmW, thmH, 0f, 5, 0, 5, 5))
+
+        cell.addView(card, FrameLayout.LayoutParams(MATCH, WRAP))
+        val tg = View(this)
+        val g = GradientDrawable()
+        g.setColor(Color.TRANSPARENT)
+        g.cornerRadius = dp(27).toFloat()
+        g.setStroke(dp(3), swAcc(), dp(8).toFloat(), dp(4).toFloat())
+        tg.background = g
+        tg.visibility = View.GONE
+        val tl = FrameLayout.LayoutParams(MATCH, MATCH)
+        tl.setMargins(-dp(5), -dp(5), -dp(5), -dp(5))
+        cell.addView(tg, tl)
+        swCells.add(Pair(cell, i))
+        swTg[i] = tg
+        card.setOnTouchListener(swTouch(t, i, cell, card))
+        return cell
+    }
+
+    // ضغط = فتح التبويب، ضغط مطوّل ثم سحب فوق بطاقة أخرى = تغيير الترتيب
+    private fun swTouch(t: Tab, i: Int, cell: View, card: View): View.OnTouchListener {
+        var sx = 0f
+        var sy = 0f
+        var on = false
+        var moved = false
+        var to = -1
+        val lpr = Runnable {
+            on = true
+            swDragging = true
+            card.alpha = 0.9f
+            card.scaleX = 1.04f
+            card.scaleY = 1.04f
+            card.translationZ = dp(12).toFloat()
+            cell.translationZ = dp(12).toFloat()
+            (cell.parent as? View)?.translationZ = dp(12).toFloat()
+            card.parent?.requestDisallowInterceptTouchEvent(true)
+            card.performHapticFeedback(android.view.HapticFeedbackConstants.LONG_PRESS)
+        }
+        return View.OnTouchListener { v, ev ->
+            when (ev.actionMasked) {
+                android.view.MotionEvent.ACTION_DOWN -> {
+                    sx = ev.rawX
+                    sy = ev.rawY
+                    on = false
+                    moved = false
+                    to = -1
+                    if (!swSelMode) ui.postDelayed(lpr, 350)
                     true
                 }
-                android.view.DragEvent.ACTION_DROP -> {
-                    val moved = ev.localState as? Tab
-                    if (moved != null) {
-                        val from = tabs.indexOf(moved)
-                        var to = tabs.size - 1
-                        for (k in 1 until box.childCount) {
-                            if (ev.y < box.getChildAt(k).bottom) {
-                                to = k - 1
+                android.view.MotionEvent.ACTION_MOVE -> {
+                    if (!on) {
+                        if (Math.hypot((ev.rawX - sx).toDouble(), (ev.rawY - sy).toDouble()) > dp(10)) {
+                            moved = true
+                            ui.removeCallbacks(lpr)
+                        }
+                    } else {
+                        card.translationX = ev.rawX - sx
+                        card.translationY = ev.rawY - sy
+                        var hit = -1
+                        for (pr in swCells) {
+                            if (pr.first === cell) continue
+                            if (swHit(pr.first, ev.rawX, ev.rawY)) {
+                                hit = pr.second
                                 break
                             }
                         }
-                        moveTab(from, to)
+                        if (hit != to) {
+                            if (to >= 0) swTg[to]?.visibility = View.GONE
+                            if (hit >= 0) swTg[hit]?.visibility = View.VISIBLE
+                            to = hit
+                        }
                     }
                     true
                 }
-                android.view.DragEvent.ACTION_DRAG_ENDED -> {
-                    fill()
+                android.view.MotionEvent.ACTION_UP -> {
+                    ui.removeCallbacks(lpr)
+                    if (on) {
+                        swDragging = false
+                        if (to >= 0) moveTab(i, to)
+                        swDraw()
+                    } else if (!moved) {
+                        v.performClick()
+                        if (swSelMode) {
+                            if (!swSel.remove(t)) swSel.add(t)
+                            swDraw()
+                        } else swPick(i)
+                    }
+                    true
+                }
+                android.view.MotionEvent.ACTION_CANCEL -> {
+                    ui.removeCallbacks(lpr)
+                    if (on) {
+                        swDragging = false
+                        swDraw()
+                    }
                     true
                 }
                 else -> true
             }
         }
+    }
 
-        val dlg = AlertDialog.Builder(this)
-            .setTitle("التبويبات (" + tabs.size + ")")
-            .setView(sv)
-            .setPositiveButton("تبويب جديد") { _, _ -> newHomeTab() }
-            .setNeutralButton("إغلاق الأخرى") { _, _ -> closeOthers() }
-            .setNegativeButton("رجوع", null)
-            .create()
-        dlgRef[0] = dlg
-        fill()
-        dlg.show()
+    // ---- الإغلاق والتراجع ----
+
+    private fun swDetach(t: Tab) {
+        tabs.remove(t)
+        try { container.removeView(t.web) } catch (e: Throwable) {}
+        try { tabsRow.removeView(t.chip) } catch (e: Throwable) {}
+        try { t.web.onPause() } catch (e: Throwable) {}
+    }
+
+    private fun swReattach(c: SwClosed) {
+        val at = minOf(c.i, tabs.size)
+        tabs.add(at, c.t)
+        container.addView(c.t.web, FrameLayout.LayoutParams(MATCH, MATCH))
+        tabsRow.addView(c.t.chip, minOf(at, maxOf(0, tabsRow.childCount - 1)))
+    }
+
+    private fun swFinalize() {
+        if (swClosed.isEmpty()) return
+        val l = ArrayList(swClosed)
+        swClosed.clear()
+        for (c in l) {
+            try { snapshot(c.t) } catch (e: Throwable) {}
+            pages.remove(c.t.web)
+            try { c.t.web.destroy() } catch (e: Throwable) {}
+        }
+    }
+
+    private fun swSnackShow(msg: String, lbl: String?, fn: (() -> Unit)?) {
+        swSnackTxt.text = msg
+        if (lbl != null) {
+            swSnackBtn.visibility = View.VISIBLE
+            swSnackBtn.text = lbl
+            swSnackBtn.setOnClickListener {
+                ui.removeCallbacks(swHideSnack)
+                swSnack.visibility = View.GONE
+                fn?.invoke()
+                swFinalize()
+            }
+        } else {
+            swSnackBtn.visibility = View.GONE
+        }
+        swSnack.visibility = View.VISIBLE
+        ui.removeCallbacks(swHideSnack)
+        ui.postDelayed(swHideSnack, 4500)
+    }
+
+    private fun swCloseAt(i: Int) {
+        val t = tabs.getOrNull(i) ?: return
+        val cell = swCells.firstOrNull { it.second == i }?.first
+        if (cell != null && cell.tag == "x") return
+        fun done() {
+            val ttl = swTitle(t)
+            val wasCur = t === cur
+            swDetach(t)
+            val rec = SwClosed(t, i)
+            swClosed.add(rec)
+            if (wasCur) {
+                if (tabs.isNotEmpty()) switchTo(tabs[minOf(i, tabs.size - 1)]) else cur = null
+            }
+            relabel()
+            swDraw()
+            swSnackShow("أُغلق «" + ttl + "»", "تراجع") {
+                if (swClosed.remove(rec)) {
+                    swReattach(rec)
+                    switchTo(rec.t)
+                    relabel()
+                    if (swShown) swDraw()
+                }
+            }
+        }
+        if (cell != null && swShown) {
+            cell.tag = "x"
+            cell.animate().scaleX(0.8f).scaleY(0.8f).alpha(0f).setDuration(180).withEndAction { done() }.start()
+        } else done()
+    }
+
+    private fun swCloseOthers() {
+        val keep = cur ?: return
+        for (t in ArrayList(tabs)) if (t !== keep) removeTab(t)
+        relabel()
+        swDraw()
+        swSnackShow("أُغلقت كل التبويبات الأخرى", null, null)
+    }
+
+    private fun swCloseAll() {
+        for (t in ArrayList(tabs)) removeTab(t)
+        cur = null
+        relabel()
+        swDraw()
+        swSnackShow("أُغلقت كل التبويبات", null, null)
+    }
+
+    private fun swStartSel() {
+        if (tabs.isEmpty()) {
+            swSnackShow("لا توجد تبويبات", null, null)
+            return
+        }
+        swSelMode = true
+        swSel.clear()
+        swDraw()
+    }
+
+    private fun swEndSel() {
+        swSelMode = false
+        swSel.clear()
+        swDraw()
+    }
+
+    private fun swDelSel() {
+        if (swSel.isEmpty()) return
+        val ct = cur
+        val rem = ArrayList<SwClosed>()
+        for (k in tabs.indices) if (swSel.contains(tabs[k])) rem.add(SwClosed(tabs[k], k))
+        for (r in rem) swDetach(r.t)
+        swClosed.addAll(rem)
+        if (tabs.isEmpty()) cur = null
+        else if (ct == null || !tabs.contains(ct)) switchTo(tabs[minOf(rem[0].i, tabs.size - 1)])
+        swSelMode = false
+        swSel.clear()
+        relabel()
+        swDraw()
+        swSnackShow("أُغلق " + nAr(rem.size) + " تبويب", "تراجع") {
+            swClosed.removeAll(rem.toSet())
+            for (r in rem) swReattach(r)
+            val back = if (ct != null && tabs.contains(ct)) ct else tabs.firstOrNull()
+            if (back != null) switchTo(back)
+            relabel()
+            if (swShown) swDraw()
+        }
+    }
+
+    // ---- المعاينة المصغّرة وشعار الموقع ----
+
+    private fun swCapture(t: Tab) {
+        try {
+            val v: View = if (t.start) startView else t.web
+            if (!v.isShown || v.width <= 0 || v.height <= 0) return
+            val s = minOf(1f, 480f / v.width)
+            val bw = maxOf(1, (v.width * s).toInt())
+            val bh = maxOf(1, (v.height * s).toInt())
+            val bm = android.graphics.Bitmap.createBitmap(bw, bh, android.graphics.Bitmap.Config.RGB_565)
+            val c = android.graphics.Canvas(bm)
+            c.drawColor(if (t.start) cBg else Color.WHITE)
+            c.scale(s, s)
+            v.draw(c)
+            t.thumb = bm
+        } catch (e: Throwable) {
+        }
     }
 
     // ---------- أدوات مساعدة ----------
@@ -2717,6 +3472,8 @@ class MainActivity : Activity() {
     }
 
     private fun switchTo(t: Tab) {
+        val old = cur
+        if (old != null && old !== t && tabs.contains(old)) swCapture(old)
         cur = t
         for (x in tabs) {
             x.web.visibility = if (x === t) View.VISIBLE else View.GONE
@@ -3295,6 +4052,274 @@ class MainActivity : Activity() {
         }
     }
 
+
+    // ---------- قسم الصور (مستقل داخل التحميلات): كل صور صفحة التبويب الحالي، تحديد وتحميل جماعي ----------
+
+    private class GImg(val u: String, var w: Int, var h: Int) {
+        var sel = false
+        var loaded = false
+        var cell: FrameLayout? = null
+        var iv: ImageView? = null
+        var mark: TextView? = null
+    }
+
+    private val galPool = Executors.newFixedThreadPool(4)
+
+    private fun saveImageSync(src: String, page: String): String {
+        val c = conn(src, hdrFor(src, page))
+        val ext = imgExt((c.contentType ?: "").lowercase(), src)
+        val f = File(cacheDir, "tango_img_" + System.nanoTime() + "." + ext)
+        try {
+            c.inputStream.use { i -> f.outputStream().use { o -> i.copyTo(o) } }
+        } finally {
+            try { c.disconnect() } catch (e: Throwable) {}
+        }
+        val mime = if (ext == "jpg") "image/jpeg" else "image/" + ext
+        return saveToDownloads(f, mime)
+    }
+
+    private fun showImagesSection() {
+        val t = cur
+        if (t == null) {
+            toast("افتح صفحة في المتصفح أولاً")
+            return
+        }
+        val page = t.web.url ?: ""
+        toast("جاري جمع صور الصفحة...")
+        val js = "(function(){try{var o=[],s={};function add(u,w,h){if(!u||s[u])return;if(u.indexOf('http')!==0)return;s[u]=1;o.push([u,w|0,h|0]);}" +
+            "var im=document.images;for(var i=0;i<im.length;i++){var e=im[i];var u=e.currentSrc||e.src||e.getAttribute('data-src')||e.getAttribute('data-original')||'';" +
+            "if(u&&u.indexOf('http')!==0){try{u=new URL(u,location.href).href}catch(x){}}" +
+            "add(u,e.naturalWidth||e.width,e.naturalHeight||e.height);}" +
+            "var all=document.querySelectorAll('*');var n=all.length;for(var j=0;j<n;j++){var b=getComputedStyle(all[j]).backgroundImage;" +
+            "if(b&&b.indexOf('url(')>=0){var m=/url\\([\"']?([^\"')]+)/.exec(b);if(m)add(m[1],all[j].clientWidth,all[j].clientHeight);}}" +
+            "return JSON.stringify(o)}catch(x){return '[]'}})()"
+        try {
+            t.web.evaluateJavascript(js) { res ->
+                val list = ArrayList<GImg>()
+                try {
+                    val v = org.json.JSONTokener(res ?: "").nextValue()
+                    if (v is String) {
+                        val a = org.json.JSONArray(v)
+                        for (i in 0 until a.length()) {
+                            val x = a.getJSONArray(i)
+                            list.add(GImg(x.getString(0), x.getInt(1), x.getInt(2)))
+                        }
+                    }
+                } catch (e: Throwable) {
+                }
+                if (list.isEmpty()) toast("لم أجد صوراً في هذه الصفحة") else openImagesDialog(list, page)
+            }
+        } catch (e: Throwable) {
+            toast("تعذر قراءة صور الصفحة")
+        }
+    }
+
+    private fun openImagesDialog(all: List<GImg>, page: String) {
+        val dlg = android.app.Dialog(this, android.R.style.Theme_Black_NoTitleBar_Fullscreen)
+        val root = LinearLayout(this)
+        root.orientation = LinearLayout.VERTICAL
+        root.setBackgroundColor(cBg)
+        root.setPadding(dp(12), dp(24), dp(12), dp(12))
+        val title = tv("", 16f, cText, true)
+        root.addView(title, lp(MATCH, WRAP, 0f, 0, 0, 0, 8))
+
+        val smallB = pill("إظهار الصور الصغيرة", false) { }
+        val allB = pill("تحديد الكل", false) { }
+        val bar1 = LinearLayout(this)
+        bar1.orientation = LinearLayout.HORIZONTAL
+        bar1.addView(smallB, lp(0, WRAP, 1f, 0, 0, 6, 0))
+        bar1.addView(allB, lp(0, WRAP, 1f))
+        root.addView(bar1, lp(MATCH, WRAP, 0f, 0, 0, 0, 6))
+
+        val dlB = pill("⬇ تحميل المحدد", true) { }
+        val closeB = pill("إغلاق", false) { dlg.dismiss() }
+        val bar2 = LinearLayout(this)
+        bar2.orientation = LinearLayout.HORIZONTAL
+        bar2.addView(dlB, lp(0, WRAP, 1f, 0, 0, 6, 0))
+        bar2.addView(closeB, lp(0, WRAP, 1f))
+        root.addView(bar2, lp(MATCH, WRAP, 0f, 0, 0, 0, 8))
+
+        val sv = ScrollView(this)
+        val grid = LinearLayout(this)
+        grid.orientation = LinearLayout.VERTICAL
+        sv.addView(grid, FrameLayout.LayoutParams(MATCH, WRAP))
+        root.addView(sv, lp(MATCH, 0, 1f))
+
+        val side = (resources.displayMetrics.widthPixels - dp(24) - dp(12)) / 3
+        var showSmall = false
+
+        fun isSmall(g: GImg): Boolean = maxOf(g.w, g.h) in 1..149
+        fun visible(): List<GImg> = if (showSmall) all else all.filter { !isSmall(it) }
+
+        fun paint(g: GImg) {
+            val m = g.mark ?: return
+            m.text = if (g.sel) "✓" else ""
+            m.background = bg(if (g.sel) cAccent else Color.argb(120, 0, 0, 0), 14, Color.WHITE)
+            g.cell?.alpha = if (g.sel) 0.75f else 1f
+        }
+
+        fun updateTitle() {
+            val vis = visible()
+            val hidden = all.size - vis.size
+            title.text = "الصور: " + vis.size + (if (hidden > 0) " (مخفي " + hidden + " صغيرة)" else "") + " • المحدد: " + all.count { it.sel }
+            val smallN = all.count { isSmall(it) }
+            smallB.text = (if (showSmall) "إخفاء الصور الصغيرة" else "إظهار الصور الصغيرة") + " (" + smallN + ")"
+            allB.text = if (vis.isNotEmpty() && vis.all { it.sel }) "إلغاء التحديد" else "تحديد الكل"
+        }
+
+        fun loadThumb(g: GImg) {
+            if (g.loaded) return
+            g.loaded = true
+            galPool.execute {
+                try {
+                    val c = conn(g.u, hdrFor(g.u, page))
+                    val d = try { c.inputStream.use { readLimited(it, 8000000) } } finally { try { c.disconnect() } catch (e: Throwable) {} }
+                    val o = android.graphics.BitmapFactory.Options()
+                    o.inJustDecodeBounds = true
+                    android.graphics.BitmapFactory.decodeByteArray(d, 0, d.size, o)
+                    var ss = 1
+                    while (o.outWidth / ss > 320) ss *= 2
+                    val o2 = android.graphics.BitmapFactory.Options()
+                    o2.inSampleSize = ss
+                    val bmp = android.graphics.BitmapFactory.decodeByteArray(d, 0, d.size, o2)
+                    if (bmp != null) {
+                        ui.post {
+                            val iv = g.iv
+                            if (iv != null && g.loaded) {
+                                iv.clearColorFilter()
+                                iv.scaleType = ImageView.ScaleType.CENTER_CROP
+                                iv.setImageBitmap(bmp)
+                            }
+                        }
+                    }
+                } catch (e: Throwable) {
+                }
+            }
+        }
+
+        fun makeCell(g: GImg): FrameLayout {
+            val c = FrameLayout(this)
+            c.background = bg(cCard, 8, cLine)
+            val iv = ImageView(this)
+            iv.scaleType = ImageView.ScaleType.CENTER
+            iv.setImageResource(R.drawable.ic_image)
+            iv.setColorFilter(cMuted)
+            c.addView(iv, FrameLayout.LayoutParams(MATCH, MATCH))
+            val mk = tv("", 16f, Color.WHITE, true)
+            mk.gravity = Gravity.CENTER
+            val mp = FrameLayout.LayoutParams(dp(28), dp(28), Gravity.TOP or Gravity.START)
+            mp.setMargins(dp(4), dp(4), 0, 0)
+            c.addView(mk, mp)
+            if (g.w > 0 && g.h > 0) {
+                val sz = tv(g.w.toString() + "×" + g.h, 10f, Color.WHITE)
+                sz.setPadding(dp(4), dp(1), dp(4), dp(1))
+                sz.background = bg(Color.argb(140, 0, 0, 0), 6)
+                val sp = FrameLayout.LayoutParams(WRAP, WRAP, Gravity.BOTTOM or Gravity.END)
+                sp.setMargins(0, 0, dp(4), dp(4))
+                c.addView(sz, sp)
+            }
+            g.cell = c
+            c.tag = g
+            g.iv = iv
+            g.mark = mk
+            c.setOnClickListener {
+                g.sel = !g.sel
+                paint(g)
+                updateTitle()
+            }
+            paint(g)
+            return c
+        }
+
+        // يفرغ معاينة الصورة من الذاكرة (يبقى تحديدها كما هو)
+        fun unloadThumb(g: GImg) {
+            if (!g.loaded) return
+            g.loaded = false
+            val iv = g.iv ?: return
+            iv.setImageResource(R.drawable.ic_image)
+            iv.setColorFilter(cMuted)
+            iv.scaleType = ImageView.ScaleType.CENTER
+        }
+
+        // تُحمَّل المعاينات للصفوف القريبة من الشاشة فقط، وتُفرَّغ البعيدة، فتبقى الذاكرة قليلة مهما كثرت الصور
+        fun loadVisible() {
+            val top = sv.scrollY - sv.height
+            val bottom = sv.scrollY + sv.height * 2
+            for (ri in 0 until grid.childCount) {
+                val r = grid.getChildAt(ri) as? ViewGroup ?: continue
+                val far = r.bottom < top || r.top > bottom
+                for (ci in 0 until r.childCount) {
+                    val g = r.getChildAt(ci).tag as? GImg ?: continue
+                    if (far) unloadThumb(g) else loadThumb(g)
+                }
+            }
+        }
+
+        fun refresh() {
+            for (g in all) (g.cell?.parent as? ViewGroup)?.removeView(g.cell)
+            grid.removeAllViews()
+            val vis = visible()
+            for (g in all) if (!vis.contains(g)) unloadThumb(g)
+            var i = 0
+            while (i < vis.size) {
+                val rowL = LinearLayout(this)
+                rowL.orientation = LinearLayout.HORIZONTAL
+                for (k in i until minOf(i + 3, vis.size)) {
+                    val g = vis[k]
+                    val c = g.cell ?: makeCell(g)
+                    rowL.addView(c, lp(side, side, 0f, 0, 0, 4, 4))
+                }
+                grid.addView(rowL, lp(MATCH, WRAP))
+                i += 3
+            }
+            updateTitle()
+            grid.post { loadVisible() }
+        }
+
+        sv.viewTreeObserver.addOnScrollChangedListener { loadVisible() }
+        smallB.setOnClickListener {
+            showSmall = !showSmall
+            refresh()
+        }
+        allB.setOnClickListener {
+            val vis = visible()
+            val allSel = vis.isNotEmpty() && vis.all { it.sel }
+            for (g in vis) {
+                g.sel = !allSel
+                paint(g)
+            }
+            updateTitle()
+        }
+        dlB.setOnClickListener {
+            val sel = all.filter { it.sel }
+            if (sel.isEmpty()) {
+                toast("اختر صوراً أولاً")
+            } else {
+                toast("جاري تحميل " + sel.size + " صورة...")
+                val ok = java.util.concurrent.atomic.AtomicInteger(0)
+                val bad = java.util.concurrent.atomic.AtomicInteger(0)
+                for (g in sel) {
+                    galPool.execute {
+                        try {
+                            saveImageSync(g.u, page)
+                            ok.incrementAndGet()
+                        } catch (e: Throwable) {
+                            bad.incrementAndGet()
+                            logErr("صورة", "فشل تحميل الصورة: " + (e.message ?: e.javaClass.simpleName), e)
+                        }
+                        if (ok.get() + bad.get() == sel.size) {
+                            ui.post { toast("تم حفظ " + ok.get() + " صورة" + (if (bad.get() > 0) " وفشلت " + bad.get() else "")) }
+                        }
+                    }
+                }
+            }
+        }
+
+        refresh()
+        dlg.setContentView(root)
+        dlg.show()
+    }
+
     // ---------- بدء التحميل مع اختيار الجودة ----------
 
     private fun startDl(u: String, h: Map<String, String>, r: Row) {
@@ -3320,24 +4345,84 @@ class MainActivity : Activity() {
         }
     }
 
+    private class HlsVar(val bw: Long, val avg: Long, val w: Int, val h: Int, val codecs: String, val fps: String, val audio: String, val url: String, val hasVideo: Boolean)
+
+    // قيمة خاصية من سطر وسم HLS (تدعم القيم بين علامتي اقتباس وفيها فواصل)
+    private fun hlsAttr(l: String, name: String): String? =
+        Regex("(?:^|[:,])" + Regex.escape(name) + "=(\"[^\"]*\"|[^,]*)").find(l)?.groupValues?.get(1)?.trim()?.trim('"')
+
+    private fun codecTag(c: String): String {
+        val x = c.lowercase()
+        return when {
+            x.contains("av01") -> "AV1"
+            x.contains("hvc1") || x.contains("hev1") || x.contains("dvh") -> "HEVC"
+            x.contains("vp09") || x.contains("vp9") -> "VP9"
+            x.contains("avc") -> "H.264"
+            else -> ""
+        }
+    }
+
+    // يقرأ القائمة الرئيسية: كل المسارات مع الدقة والنطاق والترميز ومجموعة الصوت، بلا تكرار
+    private fun parseMaster(base: String, pl: String): List<HlsVar> {
+        val out = ArrayList<HlsVar>()
+        val ls = pl.lines()
+        for (i in ls.indices) {
+            val l = ls[i].trim()
+            if (!l.startsWith("#EXT-X-STREAM-INF")) continue
+            val nx = ls.drop(i + 1).firstOrNull { it.isNotBlank() && !it.startsWith("#") } ?: continue
+            val bw = hlsAttr(l, "BANDWIDTH")?.toLongOrNull() ?: 0L
+            val avg = hlsAttr(l, "AVERAGE-BANDWIDTH")?.toLongOrNull() ?: 0L
+            val res = hlsAttr(l, "RESOLUTION") ?: ""
+            val w = res.substringBefore('x', "").toIntOrNull() ?: 0
+            val ht = res.substringAfter('x', "").toIntOrNull() ?: 0
+            val codecs = hlsAttr(l, "CODECS") ?: ""
+            val fps = hlsAttr(l, "FRAME-RATE") ?: ""
+            val grp = hlsAttr(l, "AUDIO") ?: ""
+            val cl = codecs.lowercase()
+            val hasVideo = ht > 0 || codecs.isEmpty() || Regex("avc|hvc|hev|av01|vp0?9|dvh").containsMatchIn(cl)
+            val url = try { absUrl(base, nx.trim()) } catch (e: Throwable) { continue }
+            out.add(HlsVar(bw, avg, w, ht, codecs, fps, grp, url, hasVideo))
+        }
+        // نفس الرابط مرتين: نبقي الأعلى نطاقاً
+        return out.groupBy { it.url }.map { g -> g.value.maxByOrNull { it.bw }!! }
+    }
+
+    // يستبعد مسارات الصوت فقط إن وُجد مسار فيه صورة، ثم يختار الأعلى (أو الأدنى في وضع التوفير)
+    private fun pickHls(vs: List<HlsVar>): HlsVar? {
+        val v = vs.filter { it.hasVideo }.ifEmpty { vs }
+        return if (lowQ()) v.minByOrNull { it.bw } else v.maxByOrNull { it.bw }
+    }
+
+    // رابط مسار الصوت المنفصل (EXT-X-MEDIA TYPE=AUDIO) لمجموعة الصوت المرتبطة بالمسار المختار
+    private fun hlsAudioUrl(base: String, pl: String, group: String): String? {
+        if (group.isEmpty()) return null
+        var first: String? = null
+        var def: String? = null
+        for (raw in pl.lines()) {
+            val l = raw.trim()
+            if (!l.startsWith("#EXT-X-MEDIA:")) continue
+            if (hlsAttr(l, "TYPE") != "AUDIO" || hlsAttr(l, "GROUP-ID") != group) continue
+            val uri = hlsAttr(l, "URI") ?: continue
+            val au = try { absUrl(base, uri) } catch (e: Throwable) { continue }
+            if (first == null) first = au
+            if (def == null && hlsAttr(l, "DEFAULT") == "YES") def = au
+        }
+        return def ?: first
+    }
+
     private fun variants(u: String, h: Map<String, String>): List<Variant> {
         val pl = text(u, h)
         if (!pl.contains("#EXT-X-STREAM-INF")) return emptyList()
-        val out = ArrayList<Pair<Long, Variant>>()
-        val ls = pl.lines()
-        for (i in ls.indices) {
-            val l = ls[i]
-            if (!l.startsWith("#EXT-X-STREAM-INF")) continue
-            val bw0 = Regex("(?<![A-Z-])BANDWIDTH=(\\d+)").find(l)?.groupValues?.get(1)?.toLong() ?: 0L
-            val avg = Regex("AVERAGE-BANDWIDTH=(\\d+)").find(l)?.groupValues?.get(1)?.toLong() ?: 0L
-            val bw = if (avg > 0) avg else bw0
-            val res = Regex("RESOLUTION=\\d+x(\\d+)").find(l)?.groupValues?.get(1)
-            val nx = ls.drop(i + 1).firstOrNull { it.isNotBlank() && !it.startsWith("#") } ?: continue
-            val resTxt = if (res != null) res + "p" else ""
-            val label = (if (res != null) res + "p" else "جودة") + " • " + (bw / 1000) + " kbps"
-            out.add(Pair(bw0, Variant(label, absUrl(u, nx.trim()), bw, resTxt)))
+        val all = parseMaster(u, pl)
+        val vs = all.filter { it.hasVideo }.ifEmpty { all }
+        return vs.sortedByDescending { it.bw }.map { x ->
+            val bw = if (x.avg > 0) x.avg else x.bw
+            val head = if (x.h > 0) x.h.toString() + "p" else "جودة"
+            val fr = x.fps.toDoubleOrNull()?.let { if (it > 0) Math.round(it).toString() + "fps" else "" } ?: ""
+            val ct = codecTag(x.codecs)
+            val label = head + (if (fr.isNotEmpty()) " " + fr else "") + (if (ct.isNotEmpty()) " " + ct else "") + " • " + (bw / 1000) + " kbps"
+            Variant(label, x.url, bw, if (x.h > 0) x.h.toString() + "p" else "")
         }
-        return out.sortedByDescending { it.first }.map { it.second }
     }
 
     private fun chooseQuality(vs: List<Variant>, u: String, h: Map<String, String>, r: Row) {
@@ -4022,6 +5107,7 @@ deep();
     }
 
     private fun clearFound() {
+        for (cc in cands.values) forgetTask(cc.rw.id)
         list.removeAllViews()
         found.clear()
         cands.clear()
@@ -4040,6 +5126,7 @@ deep();
     private fun fmtDur(sec: Double): String = fmtTime(sec.toLong())
 
     private fun dropCand(c: Cand) {
+        forgetTask(c.rw.id)
         list.removeView(c.view)
         found.remove(c.url)
         foundStart.remove(c.url)
@@ -4112,6 +5199,329 @@ deep();
             .show()
     }
 
+    // ---------- حفظ مهام التنزيل واستعادتها (كل مهمة مستقلة) ----------
+
+    private val taskIo = Executors.newSingleThreadExecutor()
+
+    private fun engineFor(prot: Int, fmt: String): Int {
+        val kind = when (fmt) {
+            "HLS/M3U8" -> "HLS"
+            "DASH/MPD" -> "DASH"
+            else -> "FILE"
+        }
+        return PlayerCore.choose(PlayerCore.Probe(kind, prot, false, null, ""), fmt.lowercase(java.util.Locale.US))
+    }
+
+    // يحفظ حالة المهمة الآن (يُستدعى من الخيط الرئيسي)
+    private fun saveTask(r: Row) {
+        if (r.quiet || r.removed || r.id.isEmpty()) return
+        val c = cands[r.url] ?: return
+        val m = c.meta
+        val mj = if (m != null) TaskStore.metaToJson(m.vod, m.dur, m.size, m.sizeEst, m.res, m.kbps, m.subs, m.conf, m.why) else null
+        val rec = TaskRec(
+            r.id, r.url, foundHdr[r.url] ?: emptyMap(), c.pageTitle, c.hostTxt, mj,
+            r.state, r.bar.progress, r.bar.max, r.ctl.bytes.get(), r.msg.text.toString(),
+            r.kindProt, r.kindFmt, r.engine, r.finalLoc, r.offlineId, r.protectedStream,
+            r.watch?.visibility == View.VISIBLE, foundName[r.url], foundMime[r.url], r.created, System.currentTimeMillis(), r.pageUrl
+        )
+        try { taskIo.execute { TaskStore.save(this, rec) } } catch (e: Throwable) {}
+    }
+
+    private fun forgetTask(id: String) {
+        if (id.isEmpty()) return
+        try { taskIo.execute { TaskStore.delete(this, id) } } catch (e: Throwable) {}
+    }
+
+    private fun metaFromJson(o: org.json.JSONObject?): Meta? {
+        if (o == null) return null
+        val subs = ArrayList<String>()
+        val a = o.optJSONArray("subs")
+        if (a != null) for (i in 0 until a.length()) subs.add(a.optString(i))
+        return Meta(o.optBoolean("vod", true), o.optDouble("dur", -1.0), o.optLong("size"), o.optBoolean("sizeEst"),
+            o.optString("res"), o.optLong("kbps"), subs, o.optInt("conf", 100), o.optString("why"))
+    }
+
+    // يقرأ المهام المحفوظة في الخلفية ثم يعيدها إلى القائمة بحالاتها
+    private fun restoreTasks() {
+        Thread {
+            val recs = try { TaskStore.load(this) } catch (e: Throwable) { emptyList<TaskRec>() }
+            ui.post { for (rec in recs) try { restoreOne(rec) } catch (e: Throwable) { logErr("استعادة", "تعذر استعادة مهمة: " + (e.message ?: e.javaClass.simpleName), e) } }
+        }.start()
+    }
+
+    private fun finalExists(loc: String): Boolean = try {
+        if (loc.startsWith("content:")) {
+            contentResolver.openFileDescriptor(Uri.parse(loc), "r")?.use { true } ?: false
+        } else File(loc).exists()
+    } catch (e: Throwable) {
+        false
+    }
+
+    private fun restoreOne(rec: TaskRec) {
+        val u = rec.url
+        if (found.contains(u)) return
+        rec.fname?.let { foundName[u] = it }
+        rec.mime?.let { foundMime[u] = it }
+        addFound(u, rec.hdr, metaFromJson(rec.meta), null, rec.pageTitle, rec)
+        val c = cands[u] ?: return
+        val r = c.rw
+        r.quiet = true
+        r.created = rec.created
+        rec.thumbBmp?.let { setThumb(r, it) }
+        if (rec.kindFmt.isNotEmpty()) setKind(r, rec.kindProt, rec.kindFmt)
+        r.engine = if (rec.engine != 0) rec.engine else if (rec.kindFmt.isNotEmpty()) engineFor(rec.kindProt, rec.kindFmt) else 0
+        var st = rec.state
+        var msg = rec.msg
+        when (st) {
+            3 -> {
+                val oid = rec.offlineId
+                val fl = rec.finalLoc
+                if (oid != null && OfflineDrm.get(this, oid) != null) {
+                    r.offlineId = oid
+                } else if (oid == null && fl != null && finalExists(fl)) {
+                    r.finalLoc = fl
+                    r.finalIsUri = fl.startsWith("content:")
+                } else {
+                    st = 4
+                    msg = "الملف المحفوظ لم يعد موجوداً. اضغط «تحميل» لإعادة التنزيل."
+                }
+            }
+            1, 2 -> {
+                st = 4
+                msg = "توقف التحميل لأن التطبيق أُغلق. اضغط «تحميل» للمتابعة من حيث توقف."
+            }
+        }
+        if (rec.protectedStream && st == 4) {
+            r.protectedStream = true
+            r.srcUrl = u
+            r.srcHdr = rec.hdr
+        }
+        if (st == 3 || st == 4) {
+            r.msg.text = msg
+            if (rec.total > 0) {
+                r.bar.max = rec.total
+                r.bar.progress = if (st == 3) rec.total else rec.done
+                r.bar.visibility = View.VISIBLE
+            }
+        }
+        if (st == 3) {
+            r.btn.isEnabled = false
+            r.btn.alpha = 0.5f
+        }
+        // البيانات الخام المشفّرة تبقى مكتملة لكن زر المشاهدة مخفي كما كان قبل الإغلاق
+        r.watch?.visibility = if ((st == 3 && rec.watchOk && (r.finalLoc != null || r.offlineId != null)) || (st == 4 && r.protectedStream)) View.VISIBLE else View.GONE
+        val wk = File(getExternalFilesDir(null) ?: filesDir, "work_" + r.id)
+        if (st == 4 && wk.exists()) {
+            r.work = wk
+            r.watch?.visibility = View.VISIBLE
+        }
+        setState(r, st)
+        r.quiet = false
+        saveTask(r)
+        // مهمة لم تُفحص صيغتها قبل الإغلاق: نفحصها الآن
+        if (rec.kindFmt.isEmpty()) classifyCand(c, rec.hdr)
+    }
+
+    // ---------- الصور المصغّرة وحالة الحماية والصيغة ----------
+
+    private class Kind(val prot: Int, val fmt: String)
+
+    private fun shrinkBmp(b: android.graphics.Bitmap): android.graphics.Bitmap {
+        val m = maxOf(b.width, b.height)
+        if (m <= 320) return b
+        val k = 320f / m
+        return android.graphics.Bitmap.createScaledBitmap(b, maxOf(1, (b.width * k).toInt()), maxOf(1, (b.height * k).toInt()), true)
+    }
+
+    private fun setThumb(r: Row, b: android.graphics.Bitmap?) {
+        val iv = r.thumb ?: return
+        if (b == null) return
+        iv.clearColorFilter()
+        iv.scaleType = ImageView.ScaleType.CENTER_CROP
+        iv.setImageBitmap(b)
+        r.thumbSet = true
+        if (!r.quiet && r.id.isNotEmpty()) {
+            val id = r.id
+            try { taskIo.execute { TaskStore.saveThumb(this, id, b) } } catch (e: Throwable) {}
+            saveTask(r)
+        }
+    }
+
+    private fun readLimited(s: java.io.InputStream, max: Int): ByteArray {
+        val o = java.io.ByteArrayOutputStream()
+        val buf = ByteArray(16384)
+        while (o.size() < max) {
+            val n = s.read(buf, 0, minOf(buf.size, max - o.size()))
+            if (n < 0) break
+            o.write(buf, 0, n)
+        }
+        return o.toByteArray()
+    }
+
+    // صورة المعاينة التي يوفرها الموقع (poster أو og:image): تُنزَّل بنفس ترويسات الالتقاط
+    private fun thumbFromUrl(r: Row, src: String, h: Map<String, String>) {
+        try {
+            imgPool.execute {
+                try {
+                    val c = conn(src, h)
+                    val d = try { c.inputStream.use { readLimited(it, 4000000) } } finally { try { c.disconnect() } catch (e: Throwable) {} }
+                    val o = android.graphics.BitmapFactory.Options()
+                    o.inJustDecodeBounds = true
+                    android.graphics.BitmapFactory.decodeByteArray(d, 0, d.size, o)
+                    var ss = 1
+                    while (o.outWidth / ss > 640) ss *= 2
+                    val o2 = android.graphics.BitmapFactory.Options()
+                    o2.inSampleSize = ss
+                    val bmp = android.graphics.BitmapFactory.decodeByteArray(d, 0, d.size, o2)
+                    if (bmp != null) {
+                        val sb = shrinkBmp(bmp)
+                        ui.post { if (!r.thumbSet) setThumb(r, sb) }
+                    }
+                } catch (e: Throwable) {
+                }
+            }
+        } catch (e: Throwable) {
+        }
+    }
+
+    // يسأل الصفحة عن صورة المعاينة (تُعاد المحاولة لأن الصفحة قد لا تكون جاهزة وقت الالتقاط)
+    private fun findPagePoster(c: Cand, owner: Tab?, h: Map<String, String>, tries: Int) {
+        val t = owner ?: return
+        if (c.rw.thumbSet || c.rw.removed || tries <= 0) return
+        val js = "(function(){try{var v=document.querySelector('video[poster]');if(v&&v.poster)return v.poster;" +
+            "var m=document.querySelector('meta[property=\"og:image\"],meta[name=\"twitter:image\"]');" +
+            "return m&&m.content?m.content:''}catch(e){return ''}})()"
+        try {
+            t.web.evaluateJavascript(js) { res ->
+                var s = ""
+                try {
+                    val v = org.json.JSONTokener(res ?: "").nextValue()
+                    if (v is String) s = v
+                } catch (e: Throwable) {
+                }
+                if (s.startsWith("http://") || s.startsWith("https://")) {
+                    if (!c.rw.thumbSet) thumbFromUrl(c.rw, s, h)
+                } else {
+                    ui.postDelayed({ findPagePoster(c, owner, h, tries - 1) }, 3000)
+                }
+            }
+        } catch (e: Throwable) {
+        }
+    }
+
+    // لقطة من وسائط قابلة للقراءة (ملف محفوظ)؛ لا تُستخرج من محتوى مشفّر
+    private fun thumbFromFile(r: Row, loc: String, isUri: Boolean) {
+        if (r.thumbSet) return
+        try {
+            imgPool.execute {
+                val mr = MediaMetadataRetriever()
+                try {
+                    if (isUri) mr.setDataSource(this, Uri.parse(loc)) else mr.setDataSource(loc)
+                    val dur = mr.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLongOrNull() ?: 0L
+                    val at = if (dur > 4000L) 2000000L else 0L
+                    val fr = mr.getFrameAtTime(at, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
+                    if (fr != null) {
+                        val sb = shrinkBmp(fr)
+                        ui.post { if (!r.thumbSet) setThumb(r, sb) }
+                    }
+                } catch (e: Throwable) {
+                } finally {
+                    try { mr.release() } catch (e: Throwable) {}
+                }
+            }
+        } catch (e: Throwable) {
+        }
+    }
+
+    // prot: 0 عادي، 1 محمي، 2 غير محدد
+    private fun setKind(r: Row, prot: Int, fmt: String) {
+        val t = r.kindTv ?: return
+        val st = when (prot) {
+            0 -> "عادي"
+            1 -> "محمي"
+            else -> "غير محدد"
+        }
+        val col = when (prot) {
+            0 -> Color.parseColor("#3DB36B")
+            1 -> Color.parseColor("#E0A030")
+            else -> cMuted
+        }
+        t.text = st + " — " + fmt
+        t.setTextColor(col)
+        r.kindProt = prot
+        r.kindFmt = fmt
+        r.engine = engineFor(prot, fmt)
+        saveTask(r)
+    }
+
+    private fun hasAny(s: String, vararg k: String): Boolean {
+        for (x in k) if (s.contains(x)) return true
+        return false
+    }
+
+    // يحدد الصيغة والحماية من بيانات الملف الفعلية (محتوى القائمة أو أول بايتات الملف) وليس من الامتداد وحده
+    private fun sniffKind(u0: String, h: Map<String, String>): Kind {
+        val u = u0.substringBefore("#tdlrep=")
+        if (isHls(u) || isDash(u)) {
+            val p = PlayerCore.probe(u, h, if (isHls(u)) "HLS" else "DASH")
+            return Kind(p.prot, if (p.kind == "HLS") "HLS/M3U8" else "DASH/MPD")
+        }
+        val c = conn(u, h, "bytes=0-262143")
+        val ct = (c.contentType ?: "").lowercase()
+        val b = try { c.inputStream.use { readLimited(it, 262144) } } finally { try { c.disconnect() } catch (e: Throwable) {} }
+        if (b.size < 12) return Kind(2, "غير معروف")
+        val s = String(b, Charsets.ISO_8859_1)
+        val head = s.substring(0, minOf(s.length, 64)).trimStart('\uFEFF', ' ', '\n', '\r', '\t')
+        if (head.startsWith("#EXTM3U")) {
+            val p = PlayerCore.probe(u, h, "HLS")
+            return Kind(p.prot, "HLS/M3U8")
+        }
+        if (head.startsWith("<") && s.contains("<MPD")) {
+            val p = PlayerCore.probe(u, h, "DASH")
+            return Kind(p.prot, "DASH/MPD")
+        }
+        if (s.substring(4, 8) == "ftyp") {
+            val brand = s.substring(8, 12)
+            val fmt = if (brand.startsWith("qt")) "MOV" else "MP4"
+            val marked = hasAny(s, "pssh", "cenc", "cbcs", "cbc1", "cens")
+            val prot = if (marked) 1 else if (s.contains("moov")) 0 else 2
+            return Kind(prot, fmt)
+        }
+        if (b[0] == 0x1A.toByte() && b[1] == 0x45.toByte() && b[2] == 0xDF.toByte() && b[3] == 0xA3.toByte()) {
+            val fmt = if (s.substring(0, minOf(s.length, 64)).contains("webm")) "WEBM" else "MKV"
+            val enc = s.contains("\u006D\u0080")
+            return Kind(if (enc) 1 else 0, fmt)
+        }
+        if (s.startsWith("OggS")) return Kind(0, "OGG")
+        if (s.startsWith("RIFF") && s.substring(8, 12) == "AVI ") return Kind(0, "AVI")
+        if (s.startsWith("FLV")) return Kind(0, "FLV")
+        if (b[0] == 0x47.toByte() && b.size > 376 && b[188] == 0x47.toByte() && b[376] == 0x47.toByte()) return Kind(2, "TS")
+        val fmt = when {
+            ct.contains("mp4") -> "MP4"
+            ct.contains("webm") -> "WEBM"
+            ct.contains("matroska") -> "MKV"
+            else -> "غير معروف"
+        }
+        return Kind(2, fmt)
+    }
+
+    private fun classifyCand(c: Cand, h: Map<String, String>) {
+        try {
+            analyzer.execute {
+                val k = try {
+                    sniffKind(c.url, h)
+                } catch (e: Throwable) {
+                    Kind(2, if (isHls(c.url)) "HLS/M3U8" else if (isDash(c.url)) "DASH/MPD" else "غير معروف")
+                }
+                ui.post {
+                    // ما ثبت بعد فشل التحميل أو بعد الحفظ المحمي لا يُستبدل بنتيجة أضعف
+                    if (cands[c.url] === c && c.rw.kindProt != 1) setKind(c.rw, k.prot, k.fmt)
+                }
+            }
+        } catch (e: Throwable) {
+        }
+    }
+
     private fun refreshInfo(c: Cand) {
         val m = c.meta
         val tags = ArrayList<String>()
@@ -4124,6 +5534,7 @@ deep();
         }
         c.info.text = c.hostTxt + (if (tags.isNotEmpty()) "\n" + tags.joinToString(" • ") else "")
         c.title = c.pageTitle + (if (tags.isNotEmpty()) " — " + tags.joinToString(" • ") else "")
+        saveTask(c.rw)
     }
 
     // جودة وأبعاد الملف المباشر (mp4/webm...) من بيانات الملف نفسه، بعد ظهوره في القائمة
@@ -4140,6 +5551,13 @@ deep();
                         val wd = r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH)?.toIntOrNull() ?: 0
                         val br = r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_BITRATE)?.toLongOrNull() ?: 0L
                         val du = r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLongOrNull() ?: 0L
+                        if (!c.rw.thumbSet) {
+                            val fr = try { r.getFrameAtTime(if (du > 4000L) 2000000L else 0L, MediaMetadataRetriever.OPTION_CLOSEST_SYNC) } catch (e: Throwable) { null }
+                            if (fr != null) {
+                                val sb = shrinkBmp(fr)
+                                ui.post { if (!c.rw.thumbSet) setThumb(c.rw, sb) }
+                            }
+                        }
                         val side = if (ht > 0) minOf(ht, if (wd > 0) wd else ht).takeIf { wd in 1 until ht } ?: ht else 0
                         ui.post {
                             val m = c.meta
@@ -4164,14 +5582,29 @@ deep();
 
     // مشاهدة الفيديو: النهائي إن اكتمل، وإلا الجزء المحمّل حتى الآن
     private fun watchRow(r: Row) {
+        val oid = r.offlineId
+        if (oid != null) {
+            playOffline(oid)
+            return
+        }
+        val su = r.srcUrl
+        if (r.protectedStream && r.finalLoc == null && su != null) {
+            playStream(su, r.srcHdr ?: emptyMap())
+            return
+        }
         val fl = r.finalLoc
         if (fl != null) {
-            playVideo(fl, r.finalIsUri)
+            playVideo(fl, r.finalIsUri, r.engine)
             return
         }
         val w = r.work
         if (w == null || !w.exists()) {
             toast("لم يُحمَّل أي جزء بعد")
+            return
+        }
+        if (r.state == 1 || r.state == 2) {
+            // تشغيل أثناء التنزيل: المشغّل يتابع الأجزاء الجديدة ويكمل تلقائياً
+            playLive(w.absolutePath)
             return
         }
         toast("جاري تجهيز الجزء المحمّل للمشاهدة...")
@@ -4191,6 +5624,272 @@ deep();
             }
         } catch (e: Throwable) {
         }
+    }
+
+    private val liveRows = java.util.concurrent.ConcurrentHashMap<String, Row>()
+
+    private fun playOffline(id: String) {
+        val i = Intent(this, VideoPlayerActivity::class.java)
+        i.putExtra(VideoPlayerActivity.X_OFFLINE, id)
+        try {
+            startActivity(i)
+        } catch (e: Throwable) {
+            toast("تعذر فتح المشغّل")
+        }
+    }
+
+    // إدارة المحتوى المحمي المحفوظ: عرض حالة الترخيص، تجديده، التشغيل، الحذف
+    private fun showOfflineManager() {
+        val items = OfflineDrm.list(this)
+        if (items.isEmpty()) {
+            toast("لا توجد فيديوهات محمية محفوظة")
+            return
+        }
+        toast("جاري قراءة حالة التراخيص...")
+        previewPool.execute {
+            val st = items.map { OfflineDrm.remainingText(this, it) }
+            ui.post {
+                val names = items.mapIndexed { i, it ->
+                    (if (it.name.isBlank()) "فيديو محمي" else it.name) + "\n" + fmtSize(it.bytes.toDouble()) + "  •  الترخيص: " + st[i]
+                }
+                AlertDialog.Builder(this)
+                    .setTitle("المحمية — دون اتصال")
+                    .setItems(names.toTypedArray()) { _, i -> offlineItemDialog(items[i], st[i]) }
+                    .setNegativeButton("إغلاق", null)
+                    .show()
+            }
+        }
+    }
+
+    private fun offlineItemDialog(it: OfflineDrm.Rec, status: String) {
+        val msg = "هذا المحتوى محفوظ مشفّراً كما أرسلته المنصة، ولا يمكن فتحه خارج التطبيق.\n\n" +
+            "• يعمل داخل مشغّل التطبيق فقط وبترخيص صالح.\n" +
+            "• حالة الترخيص الآن: " + status + "\n" +
+            "• عند انتهاء الترخيص يلزم اتصال وقبول من المنصة لتجديده، وإلا لا يعمل."
+        AlertDialog.Builder(this)
+            .setTitle(if (it.name.isBlank()) "فيديو محمي" else it.name)
+            .setMessage(msg)
+            .setPositiveButton("تشغيل") { _, _ -> playOffline(it.id) }
+            .setNeutralButton("تجديد الترخيص") { _, _ ->
+                toast("جاري طلب التجديد من المنصة...")
+                previewPool.execute {
+                    val err = try {
+                        OfflineDrm.renew(this, it.id)
+                        null
+                    } catch (e: Throwable) {
+                        e.message ?: "تعذر التجديد"
+                    }
+                    ui.post { toast(err ?: "تم تجديد الترخيص") }
+                }
+            }
+            .setNegativeButton("حذف") { _, _ ->
+                previewPool.execute {
+                    OfflineDrm.delete(this, it.id)
+                    ui.post {
+                        for (rw in allRows()) if (rw.offlineId == it.id) {
+                            rw.offlineId = null
+                            rw.msg.text = "حُذف المحتوى المحمي"
+                            rw.watch?.visibility = View.GONE
+                            setState(rw, 4)
+                        }
+                        toast("تم الحذف")
+                    }
+                }
+            }
+            .show()
+    }
+
+    private fun playLive(workPath: String) {
+        val i = Intent(this, VideoPlayerActivity::class.java)
+        i.putExtra(VideoPlayerActivity.X_LIVE, workPath)
+        try {
+            startActivity(i)
+        } catch (e: Throwable) {
+            toast("تعذر فتح المشغّل")
+        }
+    }
+
+    // حالة بناء المعاينة الحية: نضيف البيانات الجديدة فقط إلى ملف المعاينة بدل إعادة نسخ كل شيء
+    private class Inc { var hdr = false; var copied = 0L; var next = 0 }
+    private class LiveB(val dir: File) { val v = Inc(); val a = Inc() }
+    private val liveB = java.util.concurrent.ConcurrentHashMap<String, LiveB>()
+
+    private fun copyRange(f: File, from: Long, count: Long, o: java.io.OutputStream) {
+        java.io.FileInputStream(f).use { i ->
+            i.channel.position(from)
+            val buf = ByteArray(1 shl 16)
+            var left = count
+            while (left > 0) {
+                val n = i.read(buf, 0, minOf(buf.size.toLong(), left).toInt())
+                if (n <= 0) break
+                o.write(buf, 0, n)
+                left -= n
+            }
+        }
+    }
+
+    private fun countSegs(seg: (Int) -> File): Int {
+        var k = 0
+        while (true) {
+            val f = seg(k)
+            if (f.exists() && f.length() > 0) k++ else break
+        }
+        return k
+    }
+
+    // يضيف الأجزاء المتتالية الجديدة فقط (من inc.next حتى limit) إلى نهاية ملف المعاينة
+    private fun appendSegs(inc: Inc, out: File, ini: File?, seg: (Int) -> File, limit: Int): Boolean {
+        if (inc.hdr && !out.exists()) { inc.hdr = false; inc.copied = 0L; inc.next = 0 }
+        if (!inc.hdr) {
+            out.delete()
+            out.outputStream().buffered().use { o ->
+                if (ini != null && ini.exists() && ini.length() > 0) {
+                    ini.inputStream().use { it.copyTo(o) }
+                }
+                o.flush()
+            }
+            inc.hdr = true
+            inc.next = 0
+        }
+        var k = inc.next
+        if (k < limit) {
+            java.io.FileOutputStream(out, true).buffered().use { o ->
+                while (k < limit) {
+                    val f = seg(k)
+                    if (f.exists() && f.length() > 0) { f.inputStream().use { it.copyTo(o) }; k++ } else break
+                }
+            }
+            inc.next = k
+        }
+        return inc.next > 0
+    }
+
+    // تنزيل مباشر لملف mp4: يكتب ftyp + moov المعدّل مرة واحدة ثم يضيف بايتات mdat الجديدة فقط
+    private fun appendDirect(inc: Inc, out: File, dir: File): Boolean {
+        if (inc.hdr && !out.exists()) { inc.hdr = false; inc.copied = 0L; inc.next = 0 }
+        val mf = File(dir, "moovmeta.txt")
+        val mb = File(dir, "moov.bin")
+        if (!(mf.exists() && mb.exists())) {
+            val c0 = File(dir, "chunk_0.part")
+            val src = if (c0.exists() && c0.length() > 0) c0
+            else dir.listFiles()?.filter { it.name.endsWith(".mp4") && it.length() > 0 }?.maxByOrNull { it.length() }
+            if (src == null) return false
+            if (out.length() != src.length()) src.copyTo(out, true)
+            return out.length() > 0
+        }
+        val meta = mf.readText().split(",")
+        val mdatStart = meta[0].toLong()
+        val n = meta[1].toInt()
+        val chunk = meta[2].toLong()
+        val files = ArrayList<File>()
+        val lens = ArrayList<Long>()
+        var avail = 0L
+        for (k in 0 until n) {
+            val f = File(dir, "chunk_" + k + ".part")
+            if (!f.exists()) break
+            val l = f.length()
+            files.add(f)
+            lens.add(l)
+            avail += l
+            if (l < chunk) break
+        }
+        if (!inc.hdr) {
+            if (avail <= mdatStart + 64) return false
+            val moov = mb.readBytes()
+            val ftyp = File(dir, "ftyp.bin").readBytes()
+            patchMoov(moov, (ftyp.size + moov.size).toLong() - mdatStart)
+            out.delete()
+            out.outputStream().buffered().use { o -> o.write(ftyp); o.write(moov) }
+            inc.hdr = true
+            inc.copied = mdatStart
+        }
+        if (avail > inc.copied) {
+            java.io.FileOutputStream(out, true).buffered().use { o ->
+                var pos = 0L
+                for (i in files.indices) {
+                    val len = lens[i]
+                    val st = maxOf(pos, inc.copied)
+                    val en = pos + len
+                    if (en > st) copyRange(files[i], st - pos, en - st, o)
+                    pos += len
+                }
+            }
+            inc.copied = avail
+        }
+        return true
+    }
+
+    // يُستدعى من المشغّل المدمج على خيط خلفي: يحدّث ملف المعاينة بالبيانات الجديدة فقط، أو يعيد الملف النهائي إن اكتمل
+    private fun liveSnapshot(key: String, lastSig: Long): PlayerCore.Live {
+        val r = liveRows[key] ?: return PlayerCore.Live(null, false, true, 0L, "")
+        val fl = r.finalLoc
+        if (fl != null) {
+            liveRows.remove(key)
+            liveB.remove(key)
+            return PlayerCore.Live(fl, fl.startsWith("content:"), true, 0L, "")
+        }
+        val w = r.work ?: return PlayerCore.Live(null, false, true, 0L, "")
+        if (!w.exists()) return PlayerCore.Live(null, false, true, 0L, "")
+        // حالة 4 = أُلغي أو فشل: لا بيانات جديدة بعد الآن
+        val over = r.state == 4
+        var sig = 0L
+        try {
+            w.walkTopDown().forEach { f -> if (f.isFile && f.parentFile?.name != "preview") sig += f.length() }
+        } catch (e: Throwable) {}
+        if (sig == lastSig) return PlayerCore.Live(null, false, over, sig, "")
+        val b = liveB.getOrPut(key) {
+            val d = File(cacheDir, "live_preview/" + TaskStore.id(key))
+            d.mkdirs()
+            LiveB(d)
+        }
+        b.dir.mkdirs()
+        var vOut: File? = null
+        var aOut: File? = null
+        try {
+            if (File(w, "dv_00000.seg").exists()) {
+                // DASH بأجزاء: صورة وصوت في ملفين، يجمعهما المشغّل معاً بلا دمج ولا إعادة نسخ
+                val vc = countSegs { File(w, "dv_%05d.seg".format(it)) }
+                val ac = countSegs { File(w, "da_%05d.seg".format(it)) }
+                val n = if (ac > 0) minOf(vc, ac) else vc
+                val vo = File(b.dir, "live_v.mp4")
+                if (appendSegs(b.v, vo, File(w, "dv_init.mp4"), { File(w, "dv_%05d.seg".format(it)) }, n)) vOut = vo
+                if (vOut != null && ac > 0 && n > 0) {
+                    val ao = File(b.dir, "live_a.mp4")
+                    if (appendSegs(b.a, ao, File(w, "da_init.mp4"), { File(w, "da_%05d.seg".format(it)) }, n)) aOut = ao
+                }
+            } else if (File(w, "dv").isDirectory) {
+                val vo = File(b.dir, "live_v.mp4")
+                if (appendDirect(b.v, vo, File(w, "dv"))) vOut = vo
+                if (vOut != null && File(w, "da").isDirectory) {
+                    val ao = File(b.dir, "live_a.mp4")
+                    if (appendDirect(b.a, ao, File(w, "da"))) aOut = ao
+                }
+            } else if (File(w, "part_00000.seg").exists()) {
+                val fam = File(w, "fam_mp4").exists()
+                val ini = File(w, "init.mp4").takeIf { it.exists() && it.length() > 0 }
+                if (fam && ini == null) {
+                    // أجزاء mp4 مستقلة تحتاج دمجاً فعلياً: لا مفر من إعادة البناء
+                    val pv = buildPreview(w)
+                    if (pv != null && pv.exists() && pv.length() > 0) {
+                        val vo = File(b.dir, "live_v.mp4")
+                        if (pv.parentFile?.name == "preview" && pv.renameTo(vo)) vOut = vo
+                        else { pv.copyTo(vo, true); vOut = vo }
+                    }
+                } else {
+                    val vo = File(b.dir, if (fam) "live_v.mp4" else "live_v.ts")
+                    val n = countSegs { File(w, "part_%05d.seg".format(it)) }
+                    if (appendSegs(b.v, vo, ini, { File(w, "part_%05d.seg".format(it)) }, n)) vOut = vo
+                }
+            } else {
+                val vo = File(b.dir, "live_v.mp4")
+                if (appendDirect(b.v, vo, w)) vOut = vo
+            }
+        } catch (e: Throwable) {
+            logErr("مشاهدة", "تعذر تحديث المعاينة الحية: " + (e.message ?: e.javaClass.simpleName), e)
+        }
+        val vf = vOut
+        if (vf == null || !vf.exists() || vf.length() == 0L) return PlayerCore.Live(null, false, over, sig, "")
+        return PlayerCore.Live(vf.absolutePath, false, over, sig, "", aOut?.absolutePath)
     }
 
     // يجمع الأجزاء المتتالية من البداية (بدون ثغرات) في ملف قابل للتشغيل
@@ -4249,33 +5948,33 @@ deep();
         return out
     }
 
-    private fun playVideo(src: String, isUri: Boolean) {
-        val dlg = android.app.Dialog(this, android.R.style.Theme_Black_NoTitleBar_Fullscreen)
-        val fl = FrameLayout(this)
-        fl.setBackgroundColor(Color.BLACK)
-        val vv = android.widget.VideoView(this)
-        val mc = android.widget.MediaController(this)
-        mc.setAnchorView(vv)
-        vv.setMediaController(mc)
-        fl.addView(vv, FrameLayout.LayoutParams(MATCH, MATCH, Gravity.CENTER))
-        val close = pill("✕ إغلاق", false) { dlg.dismiss() }
-        val cp = FrameLayout.LayoutParams(WRAP, WRAP, Gravity.TOP or Gravity.START)
-        cp.setMargins(dp(12), dp(24), 0, 0)
-        fl.addView(close, cp)
-        vv.setOnErrorListener { _, _, _ ->
-            toast("تعذر تشغيل هذا الجزء، قد يحتاج تحميلاً أكثر")
-            true
-        }
-        vv.setOnPreparedListener { it.start() }
+    // التشغيل عبر المشغّل المدمج (Media3 / LibVLC) المخصص لتبويب التحميلات
+    private fun playVideo(src: String, isUri: Boolean, engine: Int = 0) {
+        val i = Intent(this, VideoPlayerActivity::class.java)
+        if (engine != 0) i.putExtra(VideoPlayerActivity.X_ENGINE, engine)
+        i.putExtra(VideoPlayerActivity.X_SRC, src)
+        i.putExtra(VideoPlayerActivity.X_URI, isUri)
         try {
-            if (isUri) vv.setVideoURI(Uri.parse(src)) else vv.setVideoPath(src)
+            startActivity(i)
         } catch (e: Throwable) {
-            toast("تعذر فتح الفيديو")
-            return
+            toast("تعذر فتح المشغّل")
         }
-        dlg.setContentView(fl)
-        dlg.setOnDismissListener { try { vv.stopPlayback() } catch (e: Throwable) {} }
-        dlg.show()
+    }
+
+    // تشغيل مباشر من الرابط (للفيديو المحمي) بنفس ترويسات الالتقاط
+    private fun playStream(u: String, h: Map<String, String>) {
+        val i = Intent(this, VideoPlayerActivity::class.java)
+        i.putExtra(VideoPlayerActivity.X_SRC, u)
+        i.putExtra(VideoPlayerActivity.X_REMOTE, true)
+        i.putExtra(VideoPlayerActivity.X_KIND, if (isHls(u)) "HLS" else if (isDash(u)) "DASH" else "")
+        val b = Bundle()
+        for ((k, v) in h) b.putString(k, v)
+        i.putExtra(VideoPlayerActivity.X_HDR, b)
+        try {
+            startActivity(i)
+        } catch (e: Throwable) {
+            toast("تعذر فتح المشغّل")
+        }
     }
 
     // يقرر هل الرابط فيديو حقيقي: يقرأ قائمة m3u8 (مسجل أم مباشر + المدة + الجودة + الحجم التقديري)، ويتحقق من نوع الملفات المباشرة
@@ -4527,7 +6226,7 @@ deep();
         showPage(1)
     }
 
-    private fun addFound(u: String, h: Map<String, String>, meta: Meta? = null, owner: Tab? = null, pageTitle: String = "") {
+    private fun addFound(u: String, h: Map<String, String>, meta: Meta? = null, owner: Tab? = null, pageTitle: String = "", restore: TaskRec? = null) {
         if (found.contains(u) || subUrls.contains(u) || (!showKnownSeg() && segUrls.contains(u))) return
         // ملف رئيسي (master): نحذف أي جودة فرعية ظهرت قبله لنفس الفيديو ولم يبدأ تحميلها
         if (meta != null && meta.subs.isNotEmpty()) {
@@ -4576,6 +6275,11 @@ deep();
             msg.text = "جاري الإلغاء..."
         }
         val rw = Row(bar, msg, btn, pauseB, cancelB, ctl, row)
+        rw.url = u
+        rw.id = TaskStore.id(u)
+        rw.pageUrl = restore?.pageUrl ?: (try { owner?.web?.url ?: "" } catch (e: Throwable) { "" })
+        if (!rw.pageUrl.startsWith("http://") && !rw.pageUrl.startsWith("https://")) rw.pageUrl = ""
+        rw.quiet = restore != null
         val go: () -> Unit = {
             if (!btn.isEnabled) toast("قيد التحميل أو تم تحميله")
             else startDl(u, h, rw)
@@ -4618,8 +6322,26 @@ deep();
         btns2.addView(classB, lp(0, WRAP, 1f, 0, 0, 6, 0))
         btns2.addView(delB, lp(0, WRAP, 1f))
 
-        row.addView(trow)
-        row.addView(host)
+        // الصورة المصغّرة (أيقونة افتراضية حتى تتوفر صورة) وبجانبها الاسم والمصدر وحالة الحماية والصيغة
+        val thumb = ImageView(this)
+        thumb.setImageResource(R.drawable.ic_image)
+        thumb.setColorFilter(cMuted)
+        thumb.scaleType = ImageView.ScaleType.CENTER
+        thumb.background = bg(cBg, 10, cLine)
+        thumb.clipToOutline = true
+        rw.thumb = thumb
+        val kindTv = tv("جارٍ الفحص...", 11f, cMuted, true)
+        rw.kindTv = kindTv
+        val infoCol = LinearLayout(this)
+        infoCol.orientation = LinearLayout.VERTICAL
+        infoCol.addView(trow)
+        infoCol.addView(host)
+        infoCol.addView(kindTv, lp(WRAP, WRAP, 0f, 0, 2, 0, 0))
+        val topRow = LinearLayout(this)
+        topRow.orientation = LinearLayout.HORIZONTAL
+        topRow.addView(thumb, lp(dp(96), dp(60), 0f, 0, 0, 10, 0))
+        topRow.addView(infoCol, lp(0, WRAP, 1f))
+        row.addView(topRow)
         row.addView(bar, lp(MATCH, WRAP, 0f, 0, 6, 0, 0))
         row.addView(msg, lp(MATCH, WRAP, 0f, 0, 2, 0, 0))
         row.addView(btns, lp(MATCH, WRAP, 0f, 0, 8, 0, 0))
@@ -4627,6 +6349,43 @@ deep();
         row.tag = rw
         list.addView(row, 0, lp(MATCH, WRAP, 0f, 0, 0, 0, 10))
         updateCounts()
+        if (restore == null) {
+            classifyCand(cand, h)
+            findPagePoster(cand, owner, h, 3)
+        }
+    }
+
+    // الحفظ الرسمي لفيديو DASH المحمي بنظام Widevine دون اتصال. يرمي ProtectedException بشرح السبب إن لم يكن ممكناً
+    private fun offlineProtected(u: String, h: Map<String, String>, r: Row, ctl: Ctl, progress: (Int, Int) -> Unit, pe: ProtectedException): OfflineDrm.Rec {
+        val base = u.substringBefore("#tdlrep=")
+        val pr = PlayerCore.probe(base, h, "DASH")
+        if (pr.prot != 1 || !pr.widevine) {
+            throw ProtectedException("هذا الفيديو محمي بنظام غير Widevine، والحفظ دون اتصال غير مدعوم له. اضغط «▶ مشاهدة» لتجربة التشغيل المباشر.")
+        }
+        val lu = pr.licenseUrl
+        if (lu == null) {
+            throw ProtectedException("هذا الفيديو محمي بنظام Widevine لكن المنصة لا تعلن رابط الترخيص داخل الملف، فلا يمكن طلب ترخيص للحفظ دون اتصال. القرار للمنصة وترخيصها. جرّب «▶ مشاهدة» للتشغيل المباشر.")
+        }
+        val nm = foundName[u]?.replace(Regex("[\\\\/:*?\"<>|]"), "_")
+        val title = if (nm.isNullOrBlank()) "tango_" + System.currentTimeMillis() else nm
+        try {
+            return OfflineDrm.download(
+                this, base, h, lu, lowQ(), title,
+                { pc, b ->
+                    ctl.bytes.set(b)
+                    progress(pc, 100)
+                },
+                { s -> ui.post { r.msg.text = s } },
+                { ctl.cancelled },
+                { ctl.paused }
+            )
+        } catch (e: java.util.concurrent.CancellationException) {
+            throw CancelledException()
+        } catch (e: ProtectedException) {
+            throw e
+        } catch (e: Throwable) {
+            throw ProtectedException((e.message ?: e.javaClass.simpleName) + "\nيمكنك تجربة «▶ مشاهدة» للتشغيل المباشر.")
+        }
     }
 
     private fun enqueue(u: String, h: Map<String, String>, r: Row) {
@@ -4644,10 +6403,16 @@ deep();
         var lastT = t0
         var lastB = 0L
         var speed = 0.0
+        var lastSave = 0L
         val progress: (Int, Int) -> Unit = { done, total ->
             ui.post {
                 r.bar.max = if (total > 0) total else 100
                 r.bar.progress = done
+                val tn = System.currentTimeMillis()
+                if (tn - lastSave > 3000) {
+                    lastSave = tn
+                    saveTask(r)
+                }
                 if (!ctl.paused && !ctl.cancelled) {
                     val now = System.currentTimeMillis()
                     val b = ctl.bytes.get()
@@ -4672,39 +6437,68 @@ deep();
         }
         queue.execute {
             // مجلد ثابت لكل رابط: عند الفشل تبقى الأجزاء المكتملة ويكمل من حيث توقف
-            val work = File(getExternalFilesDir(null) ?: filesDir, "work_" + Integer.toHexString(u.hashCode()))
+            val work = File(getExternalFilesDir(null) ?: filesDir, "work_" + TaskStore.id(u))
             var keep = false
             r.work = work
+            liveRows[work.absolutePath] = r
             ui.post { r.watch?.visibility = View.VISIBLE }
             try {
                 work.mkdirs()
                 val name = "tango_" + System.currentTimeMillis()
-                val result: String
+                var result: String
                 val saved: Pair<String, String>
+                var offRec: OfflineDrm.Rec? = null
+                var rawDrm = false
                 if (isHls(u)) {
                     val job = hls(u, h, work, ctl, progress)
                     ui.post { r.msg.text = "جاري دمج الأجزاء..." }
-                    val out = merge(job, work, name)
+                    val out = mergeHls(job, work, name)
                     saved = saveToDownloadsEx(out, "video/mp4")
                 } else if (isDash(u)) {
-                    val job = dash(u, h, work, ctl, progress)
-                    ui.post { r.msg.text = "جاري دمج الصوت والصورة..." }
-                    val out = mergeDash(job, work, name)
-                    saved = saveToDownloadsEx(out, "video/mp4")
+                    var job: DashJob? = null
+                    try {
+                        job = dash(u, h, work, ctl, progress)
+                    } catch (pe: ProtectedException) {
+                        // محمي: نحاول الحفظ الرسمي دون اتصال (ترخيص من المنصة + أجزاء مشفّرة)، وإلا يُشرح السبب
+                        offRec = offlineProtected(u, h, r, ctl, progress, pe)
+                    }
+                    if (job != null) {
+                        rawDrm = job.drm
+                        ui.post { r.msg.text = "جاري دمج الصوت والصورة..." }
+                        val out = mergeDash(job, work, name)
+                        saved = saveToDownloadsEx(out, "video/mp4")
+                    } else {
+                        saved = Pair("", "")
+                    }
                 } else {
                     val nm = foundName[u]?.replace(Regex("[\\\\/:*?\"<>|]"), "_")
                     val mp4 = File(work, if (nm.isNullOrBlank()) "$name.mp4" else nm)
                     direct(u, h, mp4, work, ctl, progress)
                     saved = saveToDownloadsEx(mp4, foundMime[u] ?: "video/mp4")
                 }
-                result = saved.first
-                r.finalLoc = saved.second
-                r.finalIsUri = saved.second.startsWith("content:")
-                ui.post {
-                    r.msg.text = "تم: $result"
-                    r.bar.progress = r.bar.max
-                    r.watch?.visibility = View.VISIBLE
-                    if (!r.removed) setState(r, 3)
+                val orr = offRec
+                if (orr != null) {
+                    // محتوى محمي محفوظ دون اتصال: لا ملف نهائي عادي، التشغيل عبر مشغّل التطبيق فقط
+                    r.offlineId = orr.id
+                    ui.post {
+                        setKind(r, 1, "DASH/MPD")
+                        r.msg.text = OfflineDrm.savedNote()
+                        r.bar.progress = r.bar.max
+                        r.watch?.visibility = View.VISIBLE
+                        if (!r.removed) setState(r, 3)
+                    }
+                } else {
+                    result = saved.first
+                    r.finalLoc = saved.second
+                    r.finalIsUri = saved.second.startsWith("content:")
+                    if (!rawDrm) thumbFromFile(r, saved.second, r.finalIsUri)
+                    ui.post {
+                        if (rawDrm) setKind(r, 1, "DASH/MPD")
+                        r.msg.text = "تم: $result" + (if (rawDrm) "\nتنبيه: الفيديو معلن عنه كمحمي، فالبيانات المحفوظة مشفّرة غالباً ولا تعمل كفيديو عادي. استخدم «المحمية» للحفظ الرسمي دون اتصال إن سمحت المنصة." else "")
+                        r.bar.progress = r.bar.max
+                        r.watch?.visibility = if (rawDrm) View.GONE else View.VISIBLE
+                        if (!r.removed) setState(r, 3)
+                    }
                 }
             } catch (e: CancelledException) {
                 ui.post {
@@ -4717,14 +6511,26 @@ deep();
             } catch (e: Throwable) {
                 keep = true
                 logErr("تحميل", "فشل تحميل " + u.substringAfterLast('/').substringBefore('?').take(40) + ": " + (e.message ?: e.javaClass.simpleName), e)
+                val prot = e is ProtectedException
+                if (prot) {
+                    ui.post { setKind(r, 1, if (isDash(u)) "DASH/MPD" else "HLS/M3U8") }
+                    r.protectedStream = true
+                    r.srcUrl = u
+                    r.srcHdr = h
+                }
                 ui.post {
-                    r.msg.text = "فشل: " + (e.message ?: e.javaClass.simpleName) + " (اضغط تحميل للإكمال من حيث توقف)"
+                    r.msg.text = if (prot) (e.message ?: "") else "فشل: " + (e.message ?: e.javaClass.simpleName) + " (اضغط تحميل للإكمال من حيث توقف)"
                     r.btn.isEnabled = true
                     r.btn.alpha = 1f
+                    if (prot) r.watch?.visibility = View.VISIBLE
                     if (!r.removed) setState(r, 4)
                 }
             } finally {
-                if (!keep) work.deleteRecursively()
+                if (!keep) {
+                    // يمنح المشغّل فرصة للانتقال إلى الملف النهائي قبل حذف مجلد العمل
+                    if (r.finalLoc == null) liveRows.remove(work.absolutePath)
+                    work.deleteRecursively()
+                }
                 if (!keep) r.work = null
                 ui.post {
                     if (r.finalLoc == null && r.work == null) r.watch?.visibility = View.GONE
@@ -4738,9 +6544,10 @@ deep();
 
     // ---------- DASH (.mpd) ----------
 
-    private class DRep(val id: String, val bw: Long, val w: Int, val h: Int, val init: String?, val segs: List<String>, val single: String?)
+    private class DRep(val id: String, val bw: Long, val w: Int, val h: Int, val init: String?, val segs: List<String>, val single: String?,
+                       val lang: String = "", val main: Boolean = true, val codecs: String = "", val fps: String = "")
     private class DashInfo(val live: Boolean, val dur: Double, val video: List<DRep>, val audio: List<DRep>, val drm: Boolean)
-    private class DashJob(val v: File, val a: File?)
+    private class DashJob(val v: File, val a: File?, val drm: Boolean = false)
     private val dashSet = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
 
     private fun isDash(u: String): Boolean {
@@ -4814,17 +6621,24 @@ deep();
                     val rid = rep.getAttribute("id")
                     val bw = rep.getAttribute("bandwidth").toLongOrNull() ?: 0L
                     val rBase = xBase(aBase, rep)
-                    val tmpl = xKids(rep, "SegmentTemplate").firstOrNull() ?: xKids(aset, "SegmentTemplate").firstOrNull()
+                    // القالب قد يتوزع على التمثيل ومجموعة التكيّف والفترة: نقرأ كل خاصية من أقرب مستوى يحددها
+                    val tmpls = listOfNotNull(
+                        xKids(rep, "SegmentTemplate").firstOrNull(),
+                        xKids(aset, "SegmentTemplate").firstOrNull(),
+                        xKids(per, "SegmentTemplate").firstOrNull()
+                    )
+                    val tmpl = tmpls.firstOrNull()
+                    fun ta(n: String): String = tmpls.map { it.getAttribute(n) }.firstOrNull { it.isNotEmpty() } ?: ""
                     var init: String? = null
                     val segs = ArrayList<String>()
                     var single: String? = null
                     if (tmpl != null) {
-                        val ts = tmpl.getAttribute("timescale").toLongOrNull() ?: 1L
-                        val sn = tmpl.getAttribute("startNumber").toLongOrNull() ?: 1L
-                        val media = tmpl.getAttribute("media")
-                        val ini = tmpl.getAttribute("initialization")
+                        val ts = ta("timescale").toLongOrNull() ?: 1L
+                        val sn = ta("startNumber").toLongOrNull() ?: 1L
+                        val media = ta("media")
+                        val ini = ta("initialization")
                         if (ini.isNotEmpty()) init = absUrl(rBase, dashFill(ini, rid, bw, 0L, 0L))
-                        val tl = xKids(tmpl, "SegmentTimeline").firstOrNull()
+                        val tl = tmpls.firstNotNullOfOrNull { xKids(it, "SegmentTimeline").firstOrNull() }
                         if (tl != null) {
                             var t = 0L
                             var num = sn
@@ -4845,7 +6659,7 @@ deep();
                                 }
                             }
                         } else {
-                            val d = tmpl.getAttribute("duration").toLongOrNull() ?: 0L
+                            val d = ta("duration").toLongOrNull() ?: 0L
                             if (d > 0 && pd > 0) {
                                 val cnt = Math.ceil(pd * ts / d).toLong()
                                 for (k in 0 until cnt) segs.add(absUrl(rBase, dashFill(media, rid, bw, sn + k, k * d)))
@@ -4860,12 +6674,18 @@ deep();
                                 val m = su.getAttribute("media")
                                 if (m.isNotEmpty()) segs.add(absUrl(rBase, m))
                             }
-                        } else if (xKids(rep, "BaseURL").isNotEmpty()) {
+                        } else if (xKids(rep, "BaseURL").isNotEmpty() ||
+                            ((xKids(rep, "SegmentBase").isNotEmpty() || xKids(aset, "SegmentBase").isNotEmpty()) && rBase != u)) {
+                            // ملف واحد (BaseURL أو SegmentBase بفهرس sidx)
                             single = rBase
                         }
                     }
                     if (single == null && segs.isEmpty()) continue
-                    val dr = DRep(rid, bw, wd, ht, init, segs, single)
+                    val role = xKids(aset, "Role").firstOrNull()?.getAttribute("value") ?: ""
+                    val isMain = role.isEmpty() || role == "main"
+                    val cod = rep.getAttribute("codecs").ifEmpty { aset.getAttribute("codecs") }
+                    val fr = rep.getAttribute("frameRate").ifEmpty { aset.getAttribute("frameRate") }
+                    val dr = DRep(rid, bw, wd, ht, init, segs, single, aset.getAttribute("lang"), isMain, cod, fr)
                     if (isA && !isV) au.add(dr) else vs.add(dr)
                 }
             }
@@ -4878,13 +6698,36 @@ deep();
         return DashInfo(live, if (bestDur > 0) bestDur else total, bestV, bestA, drm)
     }
 
+    // الصوت: المسار الرئيسي (لا الوصف الصوتي ولا التعليق) بلغة أول مجموعة، ثم الأعلى نطاقاً
+    private fun pickDashAudio(a: List<DRep>): DRep? {
+        if (a.isEmpty()) return null
+        val m = a.filter { it.main }.ifEmpty { a }
+        val lang = m.first().lang
+        val g = m.filter { it.lang == lang }.ifEmpty { m }
+        return if (lowQ()) g.minByOrNull { it.bw } else g.maxByOrNull { it.bw }
+    }
+
+    // الصورة: الأعلى نطاقاً، مع تفضيل H.264 إن كان الأعلى بترميز يصعب دمجه ويوجد H.264 بنفس الارتفاع أو أعلى
+    private fun pickDashVideo(v: List<DRep>): DRep? {
+        if (v.isEmpty()) return null
+        if (lowQ()) return v.minByOrNull { it.bw }
+        val best = v.maxByOrNull { it.bw }!!
+        val isAvc = { r: DRep -> r.codecs.isEmpty() || r.codecs.lowercase().startsWith("avc") }
+        if (isAvc(best)) return best
+        return v.filter { isAvc(it) && it.h >= best.h }.maxByOrNull { it.bw } ?: best
+    }
+
     private fun dashVariants(u: String, h: Map<String, String>): List<Variant> {
         val base = u.substringBefore("#tdlrep=")
         val info = parseMpd(base, text(base, h))
-        val ab = info.audio.maxByOrNull { it.bw }?.bw ?: 0L
+        val ab = pickDashAudio(info.audio)?.bw ?: 0L
         return info.video.sortedByDescending { it.bw }.map {
             val res = if (it.h > 0) it.h.toString() + "p" else ""
-            Variant((if (res.isNotEmpty()) res else "جودة") + " • " + (it.bw / 1000) + " kbps", base + "#tdlrep=" + it.id, it.bw + ab, res)
+            val fr = it.fps.substringBefore('/').toDoubleOrNull()?.let { f -> if (f > 0) Math.round(f).toString() + "fps" else "" } ?: ""
+            val ct = codecTag(it.codecs)
+            val label = (if (res.isNotEmpty()) res else "جودة") + (if (fr.isNotEmpty()) " " + fr else "") +
+                (if (ct.isNotEmpty()) " " + ct else "") + " • " + (it.bw / 1000) + " kbps"
+            Variant(label, base + "#tdlrep=" + it.id, it.bw + ab, res)
         }
     }
 
@@ -4899,7 +6742,7 @@ deep();
         }
         val iniF = r.init?.let { iu ->
             val f = File(work, tag + "_init.mp4")
-            if (!(f.exists() && f.length() > 0)) f.writeBytes(retry(3) { bytes(iu, h) })
+            if (!(f.exists() && f.length() > 0)) f.writeBytes(retry(3) { segBytes(iu, h) })
             f
         }
         val parts = r.segs.indices.map { File(work, tag + "_%05d.seg".format(it)) }
@@ -4910,7 +6753,7 @@ deep();
                     gate(ctl)
                     val part = parts[i]
                     if (!(part.exists() && part.length() > 0)) {
-                        val d = retry(5) { gate(ctl); bytes(su, h) }
+                        val d = retry(5) { gate(ctl); segBytes(su, h) }
                         ctl.bytes.addAndGet(d.size.toLong())
                         throttle(d.size)
                         val tmp = File(work, tag + "_%05d.tmp".format(i))
@@ -4946,16 +6789,40 @@ deep();
         val base = u0.substringBefore("#tdlrep=")
         val want = u0.substringAfter("#tdlrep=", "")
         val info = parseMpd(base, text(base, h))
-        if (info.drm && !prefs().getBoolean("ignoredrm", false)) throw Exception("الفيديو يعلن حماية DRM. لا يمكن فك هذا التشفير. للمحاولة رغم ذلك فعّل «محاولة التحميل رغم علامة DRM» من الإعدادات، أو انسخ الرابط وافتحه ببرنامج آخر")
+        if (info.drm && !prefs().getBoolean("ignoredrm", false)) throw ProtectedException("الفيديو يعلن حماية DRM فلا يمكن تنزيله كملف قابل للتشغيل. اضغط «▶ مشاهدة» لتجربة تشغيله مباشرة بنظام الحماية الرسمي إن توفّر الترخيص. (للتنزيل الخام رغم ذلك فعّل «محاولة التحميل رغم علامة DRM» من الإعدادات)")
         val v = info.video.firstOrNull { it.id == want }
-            ?: (if (lowQ()) info.video.minByOrNull { it.bw } else info.video.maxByOrNull { it.bw })
-        val a = if (lowQ()) info.audio.minByOrNull { it.bw } else info.audio.maxByOrNull { it.bw }
+            ?: pickDashVideo(info.video)
+        val a = pickDashAudio(info.audio)
         if (v == null && a == null) throw Exception("لا توجد مسارات فيديو أو صوت في الملف")
         val total = (v?.segs?.size ?: 0) + (a?.segs?.size ?: 0)
         val done = AtomicInteger(0)
-        val vf = v?.let { dashRep(it, "dv", work, h, ctl, done, total, progress) }
-        val af = a?.let { dashRep(it, "da", work, h, ctl, done, total, progress) }
-        return DashJob(vf ?: af!!, if (vf != null) af else null)
+        // الصورة والصوت معاً بالتوازي حتى تعمل المشاهدة أثناء التنزيل بصوت وصورة
+        var vf: File? = null
+        var af: File? = null
+        if (v != null && a != null) {
+            val ex = Executors.newSingleThreadExecutor()
+            val fut = ex.submit(Callable<File> { dashRep(a, "da", work, h, ctl, done, total, progress) })
+            try {
+                vf = dashRep(v, "dv", work, h, ctl, done, total, progress)
+            } catch (e: Throwable) {
+                fut.cancel(true)
+                ex.shutdownNow()
+                throw e
+            }
+            try {
+                af = fut.get()
+            } catch (e: ExecutionException) {
+                val c = e.cause
+                if (c is CancelledException) throw c
+                throw Exception(c?.message ?: "فشل تحميل الصوت")
+            } finally {
+                ex.shutdownNow()
+            }
+        } else {
+            vf = v?.let { dashRep(it, "dv", work, h, ctl, done, total, progress) }
+            af = a?.let { dashRep(it, "da", work, h, ctl, done, total, progress) }
+        }
+        return DashJob(vf ?: af!!, if (vf != null) af else null, info.drm)
     }
 
     // دمج مسار الصورة ومسار الصوت في ملف mp4 واحد: mp4parser أولاً، وMediaMuxer كبديل
@@ -5322,6 +7189,20 @@ deep();
     private fun bytes(u: String, h: Map<String, String>): ByteArray =
         conn(u, h).inputStream.use { it.readBytes() }
 
+    // جزء HLS/DASH: لا يُقبل إلا إذا وصل بالحجم الذي أعلنه الخادم (الجزء المقطوع لا يُحفظ كأنه مكتمل)
+    private fun segBytes(u: String, h: Map<String, String>): ByteArray {
+        val c = conn(u, h)
+        try {
+            val expect = c.contentLengthLong
+            val d = c.inputStream.use { it.readBytes() }
+            if (d.isEmpty()) throw Exception("جزء فارغ")
+            if (expect > 0 && d.size.toLong() != expect) throw Exception("جزء ناقص: وصل " + d.size + " من " + expect)
+            return d
+        } finally {
+            try { c.disconnect() } catch (e: Throwable) {}
+        }
+    }
+
     private fun absUrl(base: String, ref: String): String = URL(URL(base), ref).toString()
 
     private fun direct(u: String, h: Map<String, String>, out: File, work: File, ctl: Ctl, progress: (Int, Int) -> Unit) {
@@ -5439,8 +7320,8 @@ deep();
         for (f in files) f.delete()
     }
 
-    private class Seg(val index: Int, val url: String, val key: ByteArray?, val iv: ByteArray)
-    private class HlsJob(val parts: List<File>, val init: File?, val mp4Family: Boolean)
+    private class Seg(val index: Int, val url: String, val key: ByteArray?, val iv: ByteArray, val rs: Long = -1L, val re: Long = -1L)
+    private class HlsJob(val parts: List<File>, val init: File?, val mp4Family: Boolean, val audio: HlsJob? = null, val audioDir: File? = null)
 
     private fun makeIv(hex: String?, n: Int): ByteArray {
         if (hex != null) {
@@ -5457,23 +7338,12 @@ deep();
         var url = u0
         var pl = text(url, h)
 
-        // قائمة رئيسية: اختر أعلى جودة (أعلى BANDWIDTH) وافتح قائمتها
+        // قائمة رئيسية: اختر المسار (الأعلى جودة أو الأدنى في وضع التوفير، بدون مسارات الصوت فقط) وافتح قائمته
+        var audioUrl: String? = null
         if (pl.contains("#EXT-X-STREAM-INF")) {
-            var best = ""
-            var bw = -1L
-            val ls = pl.lines()
-            for (i in ls.indices) {
-                if (ls[i].startsWith("#EXT-X-STREAM-INF")) {
-                    val bwv = Regex("BANDWIDTH=(\\d+)").find(ls[i])?.groupValues?.get(1)?.toLong() ?: 0L
-                    val nx = ls.drop(i + 1).firstOrNull { it.isNotBlank() && !it.startsWith("#") } ?: continue
-                    if (bw < 0 || (if (lowQ()) bwv < bw else bwv > bw)) {
-                        bw = bwv
-                        best = nx
-                    }
-                }
-            }
-            if (best.isBlank()) throw Exception("لم يتم العثور على جودة في القائمة الرئيسية")
-            url = absUrl(url, best.trim())
+            val best = pickHls(parseMaster(url, pl)) ?: throw Exception("لم يتم العثور على جودة في القائمة الرئيسية")
+            audioUrl = hlsAudioUrl(url, pl, best.audio)
+            url = best.url
             pl = text(url, h)
         }
 
@@ -5482,6 +7352,12 @@ deep();
         var curKey: ByteArray? = null
         var curIv: String? = null
         var initUrl: String? = null
+        var initRs = -1L
+        var initRe = -1L
+        var pendLen = -1L
+        var pendOff = -1L
+        var lastUri = ""
+        var lastEnd = 0L
         val keyCache = HashMap<String, ByteArray>()
         val segs = ArrayList<Seg>()
         for (raw in pl.lines()) {
@@ -5502,14 +7378,37 @@ deep();
                     curKey = null
                     curIv = null
                 } else {
-                    throw Exception("نوع تشفير غير مدعوم: $method. فعّل «تحميل خام عند تشفير HLS غير مدعوم» من الإعدادات لحفظ الأجزاء كما هي، أو انسخ الرابط")
+                    throw ProtectedException("نوع تشفير غير مدعوم للتنزيل: $method. اضغط «▶ مشاهدة» لتجربة التشغيل المباشر إن كان الفيديو يدعم ذلك. (للتنزيل الخام فعّل «تحميل خام عند تشفير HLS غير مدعوم» من الإعدادات)")
                 }
             } else if (l.startsWith("#EXT-X-MAP")) {
                 val mu = Regex("URI=\"([^\"]+)\"").find(l)?.groupValues?.get(1)
                 if (mu != null) initUrl = absUrl(url, mu)
+                val br = hlsAttr(l, "BYTERANGE")
+                if (br != null) {
+                    val ln = br.substringBefore('@').toLongOrNull() ?: -1L
+                    val of = br.substringAfter('@', "0").toLongOrNull() ?: 0L
+                    if (ln > 0) { initRs = of; initRe = of + ln - 1 }
+                }
+            } else if (l.startsWith("#EXT-X-BYTERANGE:")) {
+                // الجزء مقطع من ملف أكبر: الطول@الإزاحة، وبدون إزاحة يكمل من نهاية المقطع السابق لنفس الملف
+                val v = l.substringAfter(':').trim()
+                pendLen = v.substringBefore('@').toLongOrNull() ?: -1L
+                pendOff = if (v.contains('@')) (v.substringAfter('@').toLongOrNull() ?: -1L) else -1L
             } else if (!l.startsWith("#")) {
                 val i = segs.size
-                segs.add(Seg(i, absUrl(url, l), curKey, makeIv(curIv, seq + i)))
+                val su = absUrl(url, l)
+                var rs = -1L
+                var re = -1L
+                if (pendLen > 0) {
+                    val st = if (pendOff >= 0) pendOff else if (su == lastUri) lastEnd else 0L
+                    rs = st
+                    re = st + pendLen - 1
+                    lastUri = su
+                    lastEnd = st + pendLen
+                    pendLen = -1L
+                    pendOff = -1L
+                }
+                segs.add(Seg(i, su, curKey, makeIv(curIv, seq + i), rs, re))
             }
         }
         if (segs.isEmpty()) throw Exception("القائمة فاضية")
@@ -5517,8 +7416,30 @@ deep();
         // نحمّل ملف التهيئة أولاً (يلزم لمشاهدة الجزء المحمّل قبل اكتمال التحميل)
         val initFile = initUrl?.let { iu ->
             val f = File(work, "init.mp4")
-            if (!(f.exists() && f.length() > 0)) f.writeBytes(retry(3) { bytes(iu, h) })
+            if (!(f.exists() && f.length() > 0)) {
+                val d = retry(3) { if (initRs >= 0) rangeBytes(iu, h, initRs, initRe) else segBytes(iu, h) }
+                if (d.isEmpty()) throw Exception("ملف التهيئة فارغ")
+                f.writeBytes(d)
+            }
             f
+        }
+        // مسار الصوت المنفصل (إن وُجد) يُحمَّل أولاً في مجلد فرعي، وفشله يُعلَن ولا يُهمَل بصمت
+        var audioJob: HlsJob? = null
+        var audioDir: File? = null
+        val au = audioUrl
+        if (au != null && au != url) {
+            val ad = File(work, "aud")
+            ad.mkdirs()
+            try {
+                audioJob = hls(au, h, ad, ctl) { _, _ -> }
+                audioDir = ad
+            } catch (e: CancelledException) {
+                throw e
+            } catch (e: ProtectedException) {
+                throw e
+            } catch (e: Throwable) {
+                throw Exception("فشل تحميل مسار الصوت المنفصل: " + (e.message ?: e.javaClass.simpleName))
+            }
         }
         val ext = segs[0].url.substringBefore('?').substringAfterLast('.').lowercase()
         val mp4Family = initFile != null || ext in setOf("mp4", "m4s", "m4v", "m4a", "cmfv", "cmfa")
@@ -5536,7 +7457,14 @@ deep();
                     val part = parts[s.index]
                     // جزء مكتمل من محاولة سابقة: لا يُعاد تحميله
                     if (!(part.exists() && part.length() > 0)) {
-                        var d = retry(5) { gate(ctl); bytes(s.url, h) }
+                        // الجزء لا يُعدّ مكتملاً إلا إذا وصل بالحجم المتوقع (للمقاطع المحدّدة بالبايت) وغير فارغ
+                        var d = retry(5) {
+                            gate(ctl)
+                            val x = if (s.rs >= 0) rangeBytes(s.url, h, s.rs, s.re) else segBytes(s.url, h)
+                            if (x.isEmpty()) throw Exception("جزء فارغ")
+                            if (s.rs >= 0 && x.size.toLong() != s.re - s.rs + 1) throw Exception("جزء ناقص")
+                            x
+                        }
                         ctl.bytes.addAndGet(d.size.toLong())
                         throttle(d.size)
                         if (s.key != null) {
@@ -5567,7 +7495,21 @@ deep();
             pool.shutdownNow()
         }
 
-        return HlsJob(parts, initFile, mp4Family)
+        return HlsJob(parts, initFile, mp4Family, audioJob, audioDir)
+    }
+
+    // دمج مسار الصورة مع مسار الصوت المنفصل إن وُجد (HLS بقوائم صوت مستقلة)
+    private fun mergeHls(job: HlsJob, work: File, name: String): File {
+        val aj = job.audio ?: return merge(job, work, name)
+        val vOut = merge(HlsJob(job.parts, job.init, job.mp4Family), work, name + "_v")
+        val adir = job.audioDir ?: File(work, "aud")
+        return try {
+            val aOut = merge(aj, adir, "a")
+            mergeDash(DashJob(vOut, aOut), work, name)
+        } catch (e: Throwable) {
+            logErr("دمج", "تعذر دمج الصوت المنفصل، سيُحفظ الفيديو بدون صوت: " + (e.message ?: e.javaClass.simpleName), e)
+            vOut
+        }
     }
 
     // 8: ترتيب الأجزاء ودمجها في ملف واحد: mp4parser أولاً، وMediaMuxer كبديل (يشمل HEVC)
@@ -6210,10 +8152,14 @@ deep();
         sizeIds["bar_back"] = Pair("شريط المتصفح العلوي", "رجوع")
         sizeIds["bar_fwd"] = Pair("شريط المتصفح العلوي", "تقدم")
         sizeIds["bar_tabs"] = Pair("شريط المتصفح العلوي", "التبويبات")
-        sizeIds["bar_reload"] = Pair("شريط المتصفح العلوي", "تحديث")
+        sizeIds["bar_menu"] = Pair("شريط المتصفح العلوي", "القائمة (الثلاث نقاط)")
+        sizeIds["bar_plus"] = Pair("شريط المتصفح العلوي", "تبويب جديد")
+        sizeIds["bar_dl"] = Pair("شريط المتصفح العلوي", "تحميل الفيديو")
+        sizeIds["bar_batch"] = Pair("شريط المتصفح العلوي", "التقاط كل الفيديوهات")
+        sizeIds["bar_home"] = Pair("شريط المتصفح العلوي", "الرئيسية")
         sizeIds["txt_pill"] = Pair("الأزرار النصية", "تحميل، نسخ الرابط، إيقاف مؤقت، إلغاء وأمثالها")
         val navs = listOf("المتصفح", "التحميلات", "الأدوات", "الإعدادات", "التنبيهات")
-        for (i in navs.indices) sizeIds["nav_" + i] = Pair("الشريط السفلي", navs[i])
+        for (i in navs.indices) sizeIds["nav_" + i] = Pair("القائمة الجانبية", navs[i])
     }
 
     private fun pctB(id: String): Int = prefs().getInt("szb_" + id, 100).coerceIn(30, 300)
@@ -6221,7 +8167,7 @@ deep();
 
     private fun applyBarSizes() {
         // الحد الأقصى لعرض كل زر كي يبقى مربع الرابط ظاهراً: 4 أزرار + 150dp للرابط والهوامش
-        val maxBox = (resources.displayMetrics.widthPixels - dp(150)) / 4
+        val maxBox = (resources.displayMetrics.widthPixels - dp(110)) / 6
         fun box(id: String): Int = minOf(dp(38 * pctB(id) / 100), maxBox).coerceAtLeast(dp(12))
         fun ap(id: String, v: View, defI: Int) {
             val b = box(id)
@@ -6239,6 +8185,11 @@ deep();
             ap("bar_back", barBack, 22)
             ap("bar_fwd", barFwd, 22)
             ap("bar_reload", reloadBtn, 22)
+            ap("bar_menu", barMenu, 22)
+            ap("bar_plus", barPlus, 22)
+            ap("bar_dl", barDl, 22)
+            ap("bar_batch", barBatch, 22)
+            ap("bar_home", barHome, 22)
             ap("bar_tabs", barTabs, 22)
             val ic = minOf(box("bar_tabs"), dp(22 * pctI("bar_tabs") / 100))
             val q = tabBtn.layoutParams
@@ -6252,7 +8203,7 @@ deep();
         }
     }
 
-    // يعيد بناء الأدوات والشريط السفلي بالأحجام الجديدة
+    // يعيد بناء الأدوات والقائمة الجانبية بالأحجام الجديدة
     private fun applySizes() {
         try {
             applyBarSizes()
@@ -6263,9 +8214,9 @@ deep();
             pageHost.removeViewAt(ti)
             pageHost.addView(nt, ti, FrameLayout.LayoutParams(MATCH, MATCH))
             nt.visibility = oldT.visibility
-            root.removeViewAt(root.childCount - 1)
+            navOverlay.removeView(navPopup)
             navItems.clear()
-            root.addView(buildNav(), lp(MATCH, WRAP))
+            navOverlay.addView(buildNav(), navPopupLp())
             showPage(page)
             restylePills(root)
         } catch (e: Throwable) {
