@@ -5948,7 +5948,7 @@ deep();
         return out
     }
 
-    // التشغيل عبر المشغّل المدمج (Media3 / LibVLC) المخصص لتبويب التحميلات
+    // التشغيل عبر المشغّل المدمج (Media3) المخصص لتبويب التحميلات
     private fun playVideo(src: String, isUri: Boolean, engine: Int = 0) {
         val i = Intent(this, VideoPlayerActivity::class.java)
         if (engine != 0) i.putExtra(VideoPlayerActivity.X_ENGINE, engine)

@@ -1,20 +1,26 @@
 package com.tangodl
 
 import android.app.Activity
-import android.app.AlertDialog
 import android.graphics.Color
+import android.graphics.drawable.ClipDrawable
+import android.graphics.drawable.Drawable
 import android.graphics.drawable.GradientDrawable
+import android.graphics.drawable.LayerDrawable
 import android.net.Uri
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.os.ParcelFileDescriptor
+import android.view.GestureDetector
 import android.view.Gravity
+import android.view.MotionEvent
+import android.text.TextUtils
 import android.view.SurfaceView
 import android.view.View
 import android.view.WindowManager
 import android.widget.FrameLayout
 import android.widget.LinearLayout
+import android.widget.ScrollView
 import android.widget.SeekBar
 import android.widget.TextView
 import android.widget.Toast
@@ -31,10 +37,6 @@ import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
 import androidx.media3.exoplayer.source.MergingMediaSource
 import androidx.media3.exoplayer.source.ProgressiveMediaSource
-import org.videolan.libvlc.LibVLC
-import org.videolan.libvlc.Media
-import org.videolan.libvlc.MediaPlayer
-import org.videolan.libvlc.util.VLCVideoLayout
 import java.io.File
 import java.net.HttpURLConnection
 import java.net.URL
@@ -44,7 +46,6 @@ import java.util.concurrent.Executors
 // PlayerCore: كشف نوع الوسائط وحالة الحماية، واختيار محرك التشغيل المناسب
 object PlayerCore {
     const val ENGINE_MEDIA3 = 1
-    const val ENGINE_VLC = 2
 
     private const val WIDEVINE = "edef8ba9-79d6-4ace-a3c8-27dcd51d21ed"
 
@@ -56,11 +57,6 @@ object PlayerCore {
 
     // prot: 0 غير محمي، 1 محمي، 2 غير محدد
     class Probe(val kind: String, val prot: Int, val widevine: Boolean, val licenseUrl: String?, val note: String, val codecs: String = "")
-
-    // صيغ يبدأ بها LibVLC لأن Media3 لا يقرؤها عادةً (وأي خطأ في المحرك الأول ينتقل تلقائياً للثاني)
-    private val vlcFirst = setOf(
-        "avi", "wmv", "asf", "rm", "rmvb", "mpg", "mpeg", "vob", "divx", "mts", "m2ts", "ogm"
-    )
 
     fun extOf(s: String): String =
         s.substringBefore('#').substringBefore('?').substringAfterLast('/').substringAfterLast('.', "").lowercase(Locale.US)
@@ -75,21 +71,7 @@ object PlayerCore {
         }
     }
 
-    // ترميزات لا يفك Media3 غالباً صوتها أو صورتها: نبدأ بها LibVLC (والتبديل التلقائي يبقى عند الفشل)
-    private val vlcCodecs = listOf("dtsc", "dtse", "dtsh", "dtsl", "mp4v", "theora", "wmv", "vc-1", "vc1", "mp2v", "mpg2")
-
-    private fun needsVlc(codecs: String): Boolean {
-        val c = codecs.lowercase(Locale.US)
-        return c.isNotEmpty() && vlcCodecs.any { c.contains(it) }
-    }
-
-    fun choose(p: Probe, ext: String): Int = when {
-        p.prot == 1 -> ENGINE_MEDIA3
-        (p.kind == "HLS" || p.kind == "DASH") && needsVlc(p.codecs) -> ENGINE_VLC
-        p.kind == "HLS" || p.kind == "DASH" -> ENGINE_MEDIA3
-        ext in vlcFirst -> ENGINE_VLC
-        else -> ENGINE_MEDIA3
-    }
+    fun choose(p: Probe, ext: String): Int = ENGINE_MEDIA3
 
     private fun fetchText(u: String, hdr: Map<String, String>): String? {
         return try {
@@ -178,7 +160,7 @@ object PlayerCore {
     }
 }
 
-// المشغّل المدمج: Media3 ExoPlayer و LibVLC، يختار التطبيق المحرك المناسب ويمكن التبديل بينهما. يُفتح من تبويب التحميلات فقط
+// المشغّل المدمج: Media3 ExoPlayer. يُفتح من تبويب التحميلات فقط
 class VideoPlayerActivity : Activity() {
     companion object {
         const val X_SRC = "src"
@@ -200,7 +182,6 @@ class VideoPlayerActivity : Activity() {
     private val hdr = HashMap<String, String>()
     private var probe: PlayerCore.Probe? = null
     private var engine = 0
-    private var triedOther = false
     private var destroyed = false
     private var dragging = false
 
@@ -226,15 +207,18 @@ class VideoPlayerActivity : Activity() {
     private var vsH = 0
     private var vsPar = 1f
 
-    private var vlc: MediaPlayer? = null
-    private var lib: LibVLC? = null
-    private var pfd: ParcelFileDescriptor? = null
 
     private lateinit var host: FrameLayout
     private lateinit var status: TextView
     private lateinit var engLabel: TextView
     private lateinit var playBtn: TextView
     private lateinit var qBtn: TextView
+    private lateinit var rootV: FrameLayout
+    private lateinit var topV: LinearLayout
+    private lateinit var barV: LinearLayout
+    private var dlgLayer: View? = null
+    private var qSel = 0
+    private var uiHidden = false
     private lateinit var seek: SeekBar
     private lateinit var tCur: TextView
     private lateinit var tTot: TextView
@@ -248,20 +232,216 @@ class VideoPlayerActivity : Activity() {
 
     private fun dp(n: Int): Int = (n * resources.displayMetrics.density + 0.5f).toInt()
 
-    private fun chipBtn(t: String, onClick: () -> Unit): TextView {
+    private val ACC = Color.parseColor("#4da3ff")
+
+    // خلفية «زجاجية» شبه شفافة بحدّ أبيض خفيف
+    private fun glass(circle: Boolean, radiusDp: Int): GradientDrawable {
+        val g = GradientDrawable()
+        if (circle) g.shape = GradientDrawable.OVAL else g.cornerRadius = dp(radiusDp).toFloat()
+        g.setColor(Color.argb(140, 24, 24, 28))
+        g.setStroke(dp(1), Color.argb(51, 255, 255, 255))
+        return g
+    }
+
+    // زر دائري زجاجي
+    private fun iconBtn(t: String, size: Int, sp: Float, onClick: () -> Unit): TextView {
+        val v = TextView(this)
+        v.text = t
+        v.setTextColor(Color.WHITE)
+        v.textSize = sp
+        v.gravity = Gravity.CENTER
+        v.width = dp(size)
+        v.height = dp(size)
+        v.background = glass(true, 0)
+        v.setOnClickListener { onClick() }
+        return v
+    }
+
+    // حبّة زجاجية (للمحرك والجودة)
+    private fun pillBtn(t: String, onClick: (() -> Unit)?): TextView {
         val v = TextView(this)
         v.text = t
         v.setTextColor(Color.WHITE)
         v.textSize = 14f
         v.gravity = Gravity.CENTER
-        v.setPadding(dp(14), dp(8), dp(14), dp(8))
-        val g = GradientDrawable()
-        g.setColor(Color.argb(153, 0, 0, 0))
-        g.cornerRadius = dp(18).toFloat()
-        g.setStroke(dp(1), Color.argb(102, 255, 255, 255))
-        v.background = g
-        v.setOnClickListener { onClick() }
+        v.minHeight = dp(40)
+        v.setPadding(dp(14), 0, dp(14), 0)
+        v.background = glass(false, 20)
+        if (onClick != null) v.setOnClickListener { onClick() }
         return v
+    }
+
+    private fun timeText(t: String): TextView {
+        val v = TextView(this)
+        v.text = t
+        v.setTextColor(Color.WHITE)
+        v.textSize = 12f
+        v.gravity = Gravity.CENTER
+        v.minWidth = dp(38)
+        v.setShadowLayer(dp(2).toFloat(), 0f, dp(1).toFloat(), Color.BLACK)
+        v.fontFeatureSettings = "tnum"
+        return v
+    }
+
+    // شريط تقدم بمسار رفيع ولون أزرق ومقبض أبيض دائري
+    private fun styleSeek(sb: SeekBar) {
+        val track = GradientDrawable()
+        track.setColor(Color.argb(77, 255, 255, 255))
+        track.cornerRadius = dp(2).toFloat()
+        val prog = GradientDrawable()
+        prog.setColor(ACC)
+        prog.cornerRadius = dp(2).toFloat()
+        val clip = ClipDrawable(prog, Gravity.LEFT, ClipDrawable.HORIZONTAL)
+        val ld = LayerDrawable(arrayOf<Drawable>(track, clip))
+        ld.setId(0, android.R.id.background)
+        ld.setId(1, android.R.id.progress)
+        for (i in 0..1) {
+            ld.setLayerHeight(i, dp(4))
+            ld.setLayerGravity(i, Gravity.CENTER_VERTICAL)
+        }
+        sb.progressDrawable = ld
+        val th = GradientDrawable()
+        th.shape = GradientDrawable.OVAL
+        th.setColor(Color.WHITE)
+        th.setSize(dp(16), dp(16))
+        sb.thumb = th
+        sb.splitTrack = false
+        sb.setPadding(dp(8), 0, dp(8), 0)
+    }
+
+    private fun radioDrawable(sel: Boolean): Drawable {
+        val ring = GradientDrawable()
+        ring.shape = GradientDrawable.OVAL
+        ring.setColor(Color.TRANSPARENT)
+        ring.setStroke(dp(2), if (sel) ACC else Color.parseColor("#6b7078"))
+        if (!sel) return ring
+        val dot = GradientDrawable()
+        dot.shape = GradientDrawable.OVAL
+        dot.setColor(ACC)
+        val ld = LayerDrawable(arrayOf<Drawable>(ring, dot))
+        ld.setLayerInset(1, dp(5), dp(5), dp(5), dp(5))
+        return ld
+    }
+
+    private fun optRow(title: String, sub: String, sel: Boolean, onClick: () -> Unit): LinearLayout {
+        val row = LinearLayout(this)
+        row.orientation = LinearLayout.HORIZONTAL
+        row.gravity = Gravity.CENTER_VERTICAL
+        row.setPadding(dp(12), dp(8), dp(12), dp(8))
+        val bg = GradientDrawable()
+        bg.cornerRadius = dp(18).toFloat()
+        bg.setColor(Color.argb(153, 0, 0, 0))
+        bg.setStroke(dp(1), if (sel) ACC else Color.argb(102, 255, 255, 255))
+        row.background = bg
+        val col = LinearLayout(this)
+        col.orientation = LinearLayout.VERTICAL
+        val t = TextView(this)
+        t.text = title
+        t.textSize = 15f
+        t.setTypeface(t.typeface, android.graphics.Typeface.BOLD)
+        t.setTextColor(if (sel) ACC else Color.WHITE)
+        col.addView(t)
+        if (sub.isNotEmpty()) {
+            val st = TextView(this)
+            st.text = sub
+            st.textSize = 12f
+            st.setTextColor(Color.parseColor("#9aa0a8"))
+            col.addView(st)
+        }
+        row.addView(col, LinearLayout.LayoutParams(0, -2, 1f))
+        val rad = View(this)
+        rad.background = radioDrawable(sel)
+        row.addView(rad, LinearLayout.LayoutParams(dp(18), dp(18)).also { it.marginStart = dp(8) })
+        row.setOnClickListener { onClick() }
+        return row
+    }
+
+    private fun closeDlg() {
+        dlgLayer?.let { try { rootV.removeView(it) } catch (e: Throwable) {} }
+        dlgLayer = null
+    }
+
+    // نافذة اختيار الجودة: صندوق زجاجي تحت زر الجودة مع شرح كل خيار
+    private fun showQualityDialog(titles: List<String>, subs: List<String>, onPick: (Int) -> Unit) {
+        closeDlg()
+        val r = rootV
+        val layer = FrameLayout(this)
+        layer.setOnClickListener { closeDlg() }
+
+        val box = LinearLayout(this)
+        box.orientation = LinearLayout.VERTICAL
+        box.setPadding(dp(10), dp(10), dp(10), dp(10))
+        box.background = glass(false, 18)
+        box.isClickable = true
+
+        val hd = LinearLayout(this)
+        hd.orientation = LinearLayout.HORIZONTAL
+        hd.gravity = Gravity.CENTER_VERTICAL
+        val ttl = TextView(this)
+        ttl.text = "اختر الجودة"
+        ttl.textSize = 15f
+        ttl.setTypeface(ttl.typeface, android.graphics.Typeface.BOLD)
+        ttl.setTextColor(Color.WHITE)
+        hd.addView(ttl, LinearLayout.LayoutParams(0, -2, 1f).also { it.marginEnd = dp(16) })
+        hd.addView(iconBtn("✕", 32, 14f) { closeDlg() })
+        box.addView(hd, LinearLayout.LayoutParams(-1, -2).also { it.setMargins(dp(2), 0, dp(2), dp(6)) })
+
+        val list = LinearLayout(this)
+        list.orientation = LinearLayout.VERTICAL
+        for (i in titles.indices) {
+            list.addView(optRow(titles[i], subs[i], i == qSel) { closeDlg(); onPick(i) },
+                LinearLayout.LayoutParams(-1, -2).also { it.setMargins(0, dp(4), 0, dp(4)) })
+        }
+        val sc = ScrollView(this)
+        sc.addView(list)
+        box.addView(sc, LinearLayout.LayoutParams(-1, -2))
+
+        val rw = r.width
+        val rh = r.height
+        val loc = IntArray(2)
+        qBtn.getLocationInWindow(loc)
+        val topPos = loc[1] + qBtn.height + dp(6)
+        box.measure(
+            View.MeasureSpec.makeMeasureSpec(rw - dp(24), View.MeasureSpec.AT_MOST),
+            View.MeasureSpec.makeMeasureSpec(rh, View.MeasureSpec.AT_MOST)
+        )
+        val avail = rh - topPos - dp(12)
+        if (box.measuredHeight > avail && avail > dp(120)) {
+            sc.layoutParams = LinearLayout.LayoutParams(-1, sc.measuredHeight - (box.measuredHeight - avail))
+        }
+        val leftPos = Math.max(dp(12), Math.min(loc[0], rw - box.measuredWidth - dp(12)))
+        val lp = FrameLayout.LayoutParams(-2, -2, Gravity.TOP or Gravity.LEFT)
+        lp.leftMargin = leftPos
+        lp.topMargin = topPos
+        layer.addView(box, lp)
+        r.addView(layer, FrameLayout.LayoutParams(-1, -1))
+        dlgLayer = layer
+    }
+
+    // إخفاء/إظهار الواجهة بنقرتين متتاليتين على الشاشة
+    private fun toggleUi() {
+        closeDlg()
+        uiHidden = !uiHidden
+        for (v in listOf<View>(topV, barV)) {
+            if (uiHidden) {
+                v.animate().alpha(0f).setDuration(200).withEndAction { if (uiHidden) v.visibility = View.INVISIBLE }.start()
+            } else {
+                v.visibility = View.VISIBLE
+                v.animate().alpha(1f).setDuration(200).start()
+            }
+        }
+    }
+
+    // نص زر الجودة في وضع «تلقائي» مع الدقة الجارية فعلاً
+    private fun refreshQ() {
+        if (qSel != 0) return
+        val h = exo?.videoSize?.height ?: 0
+        val t = "⚙ تلقائي" + (if (h > 0) " · " + h + "p" else "")
+        if (qBtn.text.toString() != t) qBtn.text = t
+    }
+
+    override fun onBackPressed() {
+        if (dlgLayer != null) closeDlg() else super.onBackPressed()
     }
 
     override fun onCreate(b: Bundle?) {
@@ -312,40 +492,37 @@ class VideoPlayerActivity : Activity() {
         status.setPadding(dp(24), dp(24), dp(24), dp(24))
         root.addView(status, FrameLayout.LayoutParams(-1, -2, Gravity.CENTER))
 
-        // الشريط العلوي: إغلاق + اسم المحرك + تبديل المحرك
+        // الشريط العلوي: إغلاق + اسم المحرك + الجودة (بنفس تصميم المعاينة)
+        root.layoutDirection = View.LAYOUT_DIRECTION_RTL
         val top = LinearLayout(this)
         top.orientation = LinearLayout.HORIZONTAL
         top.gravity = Gravity.CENTER_VERTICAL
-        top.addView(chipBtn("✕ إغلاق") { finish() })
-        engLabel = TextView(this)
-        engLabel.setTextColor(Color.WHITE)
+        top.setPadding(dp(12), dp(14), dp(12), dp(30))
+        top.background = GradientDrawable(GradientDrawable.Orientation.TOP_BOTTOM, intArrayOf(Color.argb(166, 0, 0, 0), Color.TRANSPARENT))
+        top.addView(iconBtn("✕", 40, 18f) { finish() })
+        engLabel = pillBtn("", null)
         engLabel.textSize = 13f
-        engLabel.setPadding(dp(12), 0, dp(12), 0)
-        top.addView(engLabel)
-        top.addView(chipBtn("تبديل المحرك") { switchEngine() })
-        qBtn = chipBtn("الجودة: تلقائي") { chooseQuality() }
-        top.addView(qBtn, LinearLayout.LayoutParams(-2, -2).also { it.setMargins(dp(8), 0, 0, 0) })
-        val tlp = FrameLayout.LayoutParams(-2, -2, Gravity.TOP or Gravity.START)
-        tlp.setMargins(dp(12), dp(24), dp(12), 0)
-        root.addView(top, tlp)
+        engLabel.maxLines = 2
+        engLabel.visibility = View.GONE
+        engLabel.ellipsize = TextUtils.TruncateAt.END
+        engLabel.maxWidth = (resources.displayMetrics.widthPixels * 0.5f).toInt()
+        top.addView(engLabel, LinearLayout.LayoutParams(-2, -2).also { it.marginStart = dp(8) })
+        top.addView(View(this), LinearLayout.LayoutParams(0, 1, 1f))
+        qBtn = pillBtn("⚙ تلقائي") { chooseQuality() }
+        top.addView(qBtn)
+        root.addView(top, FrameLayout.LayoutParams(-1, -2, Gravity.TOP))
 
-        // الشريط السفلي: تشغيل/إيقاف + الوقت + شريط التقدم
+        // الشريط السفلي: زر التشغيل + الوقت + شريط التقدم + المدة
         val bar = LinearLayout(this)
         bar.orientation = LinearLayout.HORIZONTAL
         bar.gravity = Gravity.CENTER_VERTICAL
-        bar.setBackgroundColor(Color.argb(102, 0, 0, 0))
-        bar.setPadding(dp(12), dp(8), dp(12), dp(16))
-        playBtn = chipBtn("▶") { togglePlay() }
-        tCur = TextView(this)
-        tCur.setTextColor(Color.WHITE)
-        tCur.textSize = 12f
-        tCur.text = "00:00"
-        tTot = TextView(this)
-        tTot.setTextColor(Color.WHITE)
-        tTot.textSize = 12f
-        tTot.text = "00:00"
+        bar.setPadding(dp(12), dp(8), dp(12), dp(8))
+        playBtn = iconBtn("▶", 40, 18f) { togglePlay() }
+        tCur = timeText("00:00")
+        tTot = timeText("00:00")
         seek = SeekBar(this)
         seek.max = 0
+        styleSeek(seek)
         seek.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
             override fun onProgressChanged(s: SeekBar?, p: Int, fromUser: Boolean) {
                 if (fromUser) tCur.text = fmt(p.toLong())
@@ -361,12 +538,38 @@ class VideoPlayerActivity : Activity() {
             }
         })
         bar.addView(playBtn)
-        bar.addView(tCur, LinearLayout.LayoutParams(-2, -2).also { it.setMargins(dp(10), 0, dp(4), 0) })
-        bar.addView(seek, LinearLayout.LayoutParams(0, -2, 1f))
-        bar.addView(tTot, LinearLayout.LayoutParams(-2, -2).also { it.setMargins(dp(4), 0, 0, 0) })
-        root.addView(bar, FrameLayout.LayoutParams(-1, -2, Gravity.BOTTOM))
+        bar.addView(tCur, LinearLayout.LayoutParams(-2, -2).also { it.marginStart = dp(10) })
+        bar.addView(seek, LinearLayout.LayoutParams(0, dp(24), 1f).also { it.marginStart = dp(10) })
+        bar.addView(tTot, LinearLayout.LayoutParams(-2, -2).also { it.marginStart = dp(10) })
+        root.addView(bar, FrameLayout.LayoutParams(-1, -2, Gravity.BOTTOM).also { it.bottomMargin = dp(12) })
+
+        rootV = root
+        topV = top
+        barV = bar
+        val gd = GestureDetector(this, object : GestureDetector.SimpleOnGestureListener() {
+            override fun onDown(e: MotionEvent): Boolean = true
+            override fun onDoubleTap(e: MotionEvent): Boolean {
+                toggleUi()
+                return true
+            }
+        })
+        root.setOnTouchListener { _, ev -> gd.onTouchEvent(ev); true }
+
+        // المسافات حسب شاشة الهاتف (الشق وشريط الحالة وشريط التنقل) مثل max(14px, safe-area) في المعاينة
+        root.setOnApplyWindowInsetsListener { _, ins ->
+            @Suppress("DEPRECATION")
+            val t = ins.systemWindowInsetTop
+            @Suppress("DEPRECATION")
+            val bt = ins.systemWindowInsetBottom
+            top.setPadding(dp(12), Math.max(dp(14), t), dp(12), dp(30))
+            val blp = bar.layoutParams as FrameLayout.LayoutParams
+            blp.bottomMargin = Math.max(dp(12), bt)
+            bar.layoutParams = blp
+            ins
+        }
 
         setContentView(root)
+        root.requestApplyInsets()
         ui.post(ticker)
 
         if (offRec != null) {
@@ -374,7 +577,7 @@ class VideoPlayerActivity : Activity() {
             begin(PlayerCore.Probe("DASH", 1, true, rec.licenseUrl, ""))
             pool.execute {
                 val t = OfflineDrm.remainingText(this, rec)
-                ui.post { if (!destroyed) engLabel.text = engLabel.text.toString() + " • محمي دون اتصال • الترخيص: " + t }
+                ui.post { if (!destroyed) { engLabel.text = "محمي دون اتصال • الترخيص: " + t; engLabel.visibility = View.VISIBLE } }
             }
         } else if (live) {
             probe = PlayerCore.Probe("FILE", 2, false, null, "")
@@ -403,8 +606,6 @@ class VideoPlayerActivity : Activity() {
     private fun nearEnd(): Boolean {
         val e = exo
         if (e != null) return e.playbackState == Player.STATE_ENDED || e.playbackState == Player.STATE_BUFFERING
-        val v = vlc
-        if (v != null) return !v.isPlaying
         return false
     }
 
@@ -483,10 +684,7 @@ class VideoPlayerActivity : Activity() {
             }
         }
         hideStatus()
-        // المحرك المحفوظ لهذه المهمة إن وُجد (لا يُستعمل مع المحمي لأنه يعمل بمحرك واحد فقط)
-        val pref = intent.getIntExtra(X_ENGINE, 0)
-        if (pref != 0 && p.prot != 1) startEngine(pref)
-        else startEngine(PlayerCore.choose(p, PlayerCore.extOf(src.substringBefore("#tdlrep="))))
+        startEngine(PlayerCore.ENGINE_MEDIA3)
     }
 
     private fun uriOf(): Uri {
@@ -519,29 +717,14 @@ class VideoPlayerActivity : Activity() {
 
     private fun startEngine(e: Int) {
         engine = e
-        engLabel.text = if (e == PlayerCore.ENGINE_MEDIA3) "المحرك: Media3" else "المحرك: VLC"
-        if (e == PlayerCore.ENGINE_MEDIA3) startExo() else startVlc()
-    }
-
-    private fun other(): Int = if (engine == PlayerCore.ENGINE_MEDIA3) PlayerCore.ENGINE_VLC else PlayerCore.ENGINE_MEDIA3
-
-    private fun switchEngine() {
-        if (probe?.prot == 1) {
-            toast("المحتوى المحمي يعمل بمحرك Media3 فقط")
-            return
-        }
-        if (probe == null) return
-        triedOther = true
-        hideStatus()
-        if (lastPos > 0) resumeAt = lastPos
-        startEngine(if (engine == PlayerCore.ENGINE_MEDIA3) PlayerCore.ENGINE_VLC else PlayerCore.ENGINE_MEDIA3)
+        startExo()
     }
 
     // قائمة المسارات الفعلية التي يعلنها البث (الدقة ومعدل البت وعدد الإطارات) ليختار المستخدم أحدها، أو «تلقائي»
     private fun chooseQuality() {
         val e = exo
         if (e == null) {
-            toast("اختيار الجودة متاح مع محرك Media3 فقط")
+            toast("قائمة الجودة غير متاحة الآن")
             return
         }
         class Opt(val g: androidx.media3.common.Tracks.Group, val idx: Int, val h: Int, val br: Int, val fps: Float)
@@ -559,28 +742,30 @@ class VideoPlayerActivity : Activity() {
             return
         }
         opts.sortWith(compareByDescending<Opt> { it.h }.thenByDescending { it.br })
-        val names = ArrayList<String>()
-        names.add("تلقائي")
+        val titles = ArrayList<String>()
+        val subs = ArrayList<String>()
+        val curH = e.videoSize.height
+        titles.add("تلقائي")
+        subs.add(if (curH > 0) "حالياً " + curH + "p" else "")
         for (o in opts) {
-            val res = if (o.h > 0) o.h.toString() + "p" else "جودة"
-            val br = if (o.br > 0) " • " + (o.br / 1000) + " kbps" else ""
-            val fr = if (o.fps > 0f) " • " + Math.round(o.fps) + "fps" else ""
-            names.add(res + br + fr)
+            titles.add(if (o.h > 0) o.h.toString() + "p" else "جودة")
+            val parts = ArrayList<String>()
+            if (o.br > 0) parts.add((o.br / 1000).toString() + " kbps")
+            if (o.fps > 0f) parts.add(Math.round(o.fps).toString() + "fps")
+            subs.add(parts.joinToString(" • "))
         }
-        AlertDialog.Builder(this)
-            .setTitle("اختر الجودة")
-            .setItems(names.toTypedArray()) { _, i ->
-                try {
-                    val b = e.trackSelectionParameters.buildUpon()
-                    if (i == 0) b.clearOverridesOfType(C.TRACK_TYPE_VIDEO)
-                    else b.setOverrideForType(TrackSelectionOverride(opts[i - 1].g.mediaTrackGroup, opts[i - 1].idx))
-                    e.trackSelectionParameters = b.build()
-                    qBtn.text = "الجودة: " + names[i]
-                } catch (x: Throwable) {
-                    toast("تعذر تغيير الجودة")
-                }
+        showQualityDialog(titles, subs) { i ->
+            try {
+                val b = e.trackSelectionParameters.buildUpon()
+                if (i == 0) b.clearOverridesOfType(C.TRACK_TYPE_VIDEO)
+                else b.setOverrideForType(TrackSelectionOverride(opts[i - 1].g.mediaTrackGroup, opts[i - 1].idx))
+                e.trackSelectionParameters = b.build()
+                qSel = i
+                if (i == 0) refreshQ() else qBtn.text = "⚙ " + titles[i]
+            } catch (x: Throwable) {
+                toast("تعذر تغيير الجودة")
             }
-            .show()
+        }
     }
 
     private fun drmMsg(code: Int): String = when (code) {
@@ -592,7 +777,7 @@ class VideoPlayerActivity : Activity() {
         else -> "خطأ في نظام الحماية (كود $code)"
     }
 
-    // يُستدعى عند فشل أحد المحركين: الحماية تُشرح، وغيرها يُجرَّب فيه المحرك الآخر تلقائياً
+    // يُستدعى عند فشل المحرك: الحماية تُشرح، وغيرها يظهر له خطأ واضح
     private fun onEngineError(which: Int, code: Int) {
         if (destroyed || which != engine) return
         if (live && !(which == PlayerCore.ENGINE_MEDIA3 && code in 6000..6999)) {
@@ -640,18 +825,11 @@ class VideoPlayerActivity : Activity() {
             fail("تعذر تشغيل المحتوى المحمي. قد لا يدعم جهازك Widevine أو لم يقبل الخادم الترخيص (كود $code)")
             return
         }
-        if (!triedOther) {
-            triedOther = true
-            showStatus("جاري تجربة المحرك الآخر...")
-            startEngine(other())
-            return
-        }
-        fail("تعذر تشغيل الملف بالمحركين. قد تكون بياناته مشفّرة أو غير مكتملة.")
+        fail("تعذر تشغيل الملف. قد تكون بياناته مشفّرة أو غير مكتملة أو بصيغة غير مدعومة.")
     }
 
     private fun fail(msg: String) {
         releaseExo()
-        releaseVlc()
         host.removeAllViews()
         playBtn.text = "▶"
         showStatus(msg)
@@ -662,7 +840,6 @@ class VideoPlayerActivity : Activity() {
     private fun startExo() {
         try {
             releaseExo()
-            releaseVlc()
             host.removeAllViews()
             val sv = SurfaceView(this)
             surface = sv
@@ -718,7 +895,7 @@ class VideoPlayerActivity : Activity() {
                 }
 
                 override fun onIsPlayingChanged(isPlaying: Boolean) {
-                    playBtn.text = if (isPlaying) "⏸" else "▶"
+                    playBtn.text = if (isPlaying) "❚❚" else "▶"
                 }
             })
             player.setVideoSurfaceView(sv)
@@ -763,101 +940,22 @@ class VideoPlayerActivity : Activity() {
         vsH = 0
     }
 
-    // ---------- LibVLC ----------
-
-    private fun startVlc() {
-        try {
-            releaseExo()
-            releaseVlc()
-            host.removeAllViews()
-            val l = LibVLC(this, ArrayList<String>())
-            lib = l
-            val layout = VLCVideoLayout(this)
-            host.addView(layout, FrameLayout.LayoutParams(-1, -1))
-            val mp = MediaPlayer(l)
-            vlc = mp
-            mp.attachViews(layout, null, false, false)
-
-            val s = src.substringBefore("#tdlrep=")
-            val media: Media = if (!remote && s.startsWith("content:")) {
-                val d = contentResolver.openFileDescriptor(Uri.parse(s), "r")
-                    ?: throw Exception("تعذر فتح الملف")
-                pfd = d
-                Media(l, d.fileDescriptor)
-            } else {
-                Media(l, uriOf())
-            }
-            audioPath?.let { if (!remote) media.addOption(":input-slave=" + Uri.fromFile(File(it)).toString()) }
-            if (remote) {
-                hdr["User-Agent"]?.let { if (it.isNotBlank()) media.addOption(":http-user-agent=$it") }
-                hdr["Referer"]?.let { if (it.isNotBlank()) media.addOption(":http-referrer=$it") }
-            }
-            mp.media = media
-            media.release()
-            mp.setEventListener { ev ->
-                val t = ev.type
-                ui.post {
-                    if (!destroyed && engine == PlayerCore.ENGINE_VLC) {
-                        when (t) {
-                            MediaPlayer.Event.EncounteredError -> onEngineError(PlayerCore.ENGINE_VLC, 0)
-                            MediaPlayer.Event.Playing -> {
-                                hideStatus()
-                                playBtn.text = "⏸"
-                                        waiting = false
-                                if (resumeAt > 0) {
-                                    try { mp.time = resumeAt } catch (e: Throwable) {}
-                                    resumeAt = 0
-                                }
-                            }
-                            MediaPlayer.Event.Paused -> playBtn.text = "▶"
-                            MediaPlayer.Event.Stopped -> playBtn.text = "▶"
-                            MediaPlayer.Event.EndReached -> {
-                                playBtn.text = "▶"
-                                if (live) waitMore()
-                            }
-                        }
-                    }
-                }
-            }
-            mp.play()
-        } catch (e: Throwable) {
-            onEngineError(PlayerCore.ENGINE_VLC, 0)
-        }
-    }
-
-    private fun releaseVlc() {
-        val mp = vlc
-        val l = lib
-        vlc = null
-        lib = null
-        try { mp?.stop() } catch (e: Throwable) {}
-        try { mp?.detachViews() } catch (e: Throwable) {}
-        try { mp?.release() } catch (e: Throwable) {}
-        try { l?.release() } catch (e: Throwable) {}
-        try { pfd?.close() } catch (e: Throwable) {}
-        pfd = null
-    }
-
     // ---------- التحكم المشترك ----------
 
     private fun togglePlay() {
         val e = exo
-        val v = vlc
         if (e != null) {
             if (e.isPlaying) e.pause()
             else {
                 if (e.playbackState == Player.STATE_ENDED) e.seekTo(0)
                 e.play()
             }
-        } else if (v != null) {
-            if (v.isPlaying) v.pause() else v.play()
         }
     }
 
     private fun seekTo(ms: Long) {
         try {
             exo?.seekTo(ms)
-            vlc?.let { it.time = ms }
         } catch (e: Throwable) {
         }
     }
@@ -867,13 +965,9 @@ class VideoPlayerActivity : Activity() {
         var dur = 0L
         try {
             val e = exo
-            val v = vlc
             if (e != null) {
                 pos = e.currentPosition
                 dur = e.duration
-            } else if (v != null) {
-                pos = v.time
-                dur = v.length
             }
         } catch (e: Throwable) {
         }
@@ -887,19 +981,18 @@ class VideoPlayerActivity : Activity() {
             tCur.text = fmt(pos)
         }
         tTot.text = fmt(dur)
+        refreshQ()
     }
 
     override fun onPause() {
         super.onPause()
         try { exo?.pause() } catch (e: Throwable) {}
-        try { vlc?.pause() } catch (e: Throwable) {}
     }
 
     override fun onDestroy() {
         destroyed = true
         ui.removeCallbacksAndMessages(null)
         releaseExo()
-        releaseVlc()
         pool.shutdownNow()
         for (f in liveFiles) try { File(f).delete() } catch (e: Throwable) {}
         super.onDestroy()
