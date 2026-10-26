@@ -26,9 +26,12 @@ jobs:
             echo "::error title=GradleLog::$msg"
           fi
           exit $code
-      - name: Zip
-        run: cd app/build/outputs/apk/debug && zip -9 TangoDL.zip app-debug.apk
+      - name: Compress
+        run: |
+          command -v 7z >/dev/null || sudo apt-get install -y p7zip-full
+          cd app/build/outputs/apk/debug
+          7z a -t7z -mx=9 -m0=lzma2 -md=128m -mfb=273 -ms=on TangoDL.7z app-debug.apk
       - name: Release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "v${{ github.run_number }}" app/build/outputs/apk/debug/TangoDL.zip --title "TangoDL" --notes "apk"
+        run: gh release create "v${{ github.run_number }}" app/build/outputs/apk/debug/TangoDL.7z --title "TangoDL" --notes "apk"
