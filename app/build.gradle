@@ -17,6 +17,14 @@ android {
         targetCompatibility JavaVersion.VERSION_17
     }
     kotlinOptions { jvmTarget = "17" }
+    // ملفات غير مضغوطة داخل الـAPK ليضغطها 7z بكفاءة أكبر
+    packagingOptions {
+        dex { useLegacyPackaging false }
+        jniLibs { useLegacyPackaging false }
+    }
+    androidResources {
+        noCompress 'xml', 'png', 'jpg', 'jpeg', 'webp', 'gif', 'json', 'txt', 'html', 'js', 'css', 'ttf', 'otf', 'properties', 'bin', 'dat', 'version', 'kotlin_module'
+    }
 }
 dependencies {
     implementation 'com.googlecode.mp4parser:isoparser:1.1.22'
