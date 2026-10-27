@@ -276,14 +276,14 @@ class ViewerActivity : Activity() {
             } catch (e: Throwable) {
                 "تعذر الحفظ: " + (e.message ?: "")
             }
-            ui.post { DlgStyle.toast(this, r, true) }
+            ui.post { Toast.makeText(this, r, Toast.LENGTH_LONG).show() }
         }.start()
     }
 
     private fun openOther() {
         val u = src ?: return
         if (u.scheme != "file") {
-            try { FileUtil.open(this, u, FileUtil.mimeOf(name)) } catch (e: Throwable) { DlgStyle.toast(this, "لا يوجد تطبيق يفتح هذا الملف", false) }
+            try { FileUtil.open(this, u, FileUtil.mimeOf(name)) } catch (e: Throwable) { Toast.makeText(this, "لا يوجد تطبيق يفتح هذا الملف", Toast.LENGTH_SHORT).show() }
             return
         }
         // ملفات التطبيق الداخلية: نحفظ نسخة في التحميلات ثم نفتحها
@@ -295,11 +295,11 @@ class ViewerActivity : Activity() {
                         val o = if (r.startsWith("content:")) Uri.parse(r) else Uri.fromFile(File(r))
                         FileUtil.open(this, o, FileUtil.mimeOf(name))
                     } catch (e: Throwable) {
-                        DlgStyle.toast(this, "لا يوجد تطبيق يفتح هذا الملف", false)
+                        Toast.makeText(this, "لا يوجد تطبيق يفتح هذا الملف", Toast.LENGTH_SHORT).show()
                     }
                 }
             } catch (e: Throwable) {
-                ui.post { DlgStyle.toast(this, "تعذر الفتح: " + (e.message ?: ""), true) }
+                ui.post { Toast.makeText(this, "تعذر الفتح: " + (e.message ?: ""), Toast.LENGTH_LONG).show() }
             }
         }.start()
     }
@@ -566,7 +566,7 @@ class StorageActivity : Activity() {
             } catch (e: Throwable) {
                 "تعذر الحفظ: " + (e.message ?: "")
             }
-            ui.post { DlgStyle.toast(this, r, true) }
+            ui.post { Toast.makeText(this, r, Toast.LENGTH_LONG).show() }
         }.start()
     }
 
@@ -579,17 +579,17 @@ class StorageActivity : Activity() {
             i.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
             startActivity(Intent.createChooser(i, "مشاركة"))
         } catch (e: Throwable) {
-            DlgStyle.toast(this, "تعذرت المشاركة", false)
+            Toast.makeText(this, "تعذرت المشاركة", Toast.LENGTH_SHORT).show()
         }
     }
 
     private fun deleteItem(item: Item) {
-        StyledBuilder(this).setTitle("حذف الملف").setMessage(item.name)
+        AlertDialog.Builder(this).setTitle("حذف الملف").setMessage(item.name)
             .setPositiveButton("حذف") { _, _ ->
                 try {
                     if (item.uri != null) contentResolver.delete(item.uri, null, null) else item.file?.delete()
                 } catch (e: Throwable) {
-                    DlgStyle.toast(this, "تعذر الحذف", false)
+                    Toast.makeText(this, "تعذر الحذف", Toast.LENGTH_SHORT).show()
                 }
                 refresh()
             }.setNegativeButton("إلغاء", null).show()

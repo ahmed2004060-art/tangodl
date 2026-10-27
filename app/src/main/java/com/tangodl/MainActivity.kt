@@ -160,17 +160,12 @@ class MainActivity : Activity() {
     private lateinit var activeBox: LinearLayout
     private lateinit var activeTitle: TextView
     private lateinit var badge: TextView
+    private lateinit var dlFab: TextView
     private lateinit var dlActions: LinearLayout
     private lateinit var listTitle: TextView
     private lateinit var dlScroll: ScrollView
-    // 0 = شاشة التحميلات، 1 = شاشة عداد ملتقط الروابط (الملتقطة فقط)
-    private var dlView = 0
-    private var badgeSeen = true
-    private var lastFound = 0
-    private lateinit var badgeBox: LinearLayout
-    private lateinit var badgeNum: TextView
-    private lateinit var tabDl: TextView
-    private lateinit var cntTitle: TextView
+    private var dlFilter = 0
+    private val dlChips = ArrayList<TextView>()
 
     // بدء تحميل كل رابط ملتقط وهيدرزه (لأزرار الفيديو داخل الصفحة)
     private val foundStart = HashMap<String, () -> Unit>()
@@ -236,8 +231,7 @@ class MainActivity : Activity() {
 
     private fun classifyDialog(c: Cand) {
         val labels = arrayOf("مسجل (هذا الرابط)", "بث مباشر (هذا الرابط)", "كل روابط هذا الموقع مسجلة", "كل روابط هذا الموقع بث مباشر", "إزالة التصنيف اليدوي")
-        val icons = intArrayOf(R.drawable.ic_video, R.drawable.ic_live, R.drawable.ic_web, R.drawable.ic_web, R.drawable.ic_refresh)
-        fun apply(i: Int) {
+        AlertDialog.Builder(this).setTitle("تصنيف الفيديو").setItems(labels) { _, i ->
             val u = c.url
             when (i) {
                 0 -> { setOvr(u, "url", true); applyVerdict(c, true) }
@@ -253,36 +247,21 @@ class MainActivity : Activity() {
                 else -> { setOvr(u, "url", null); toast("أُزيل التصنيف اليدوي، يُحكم على الرابط تلقائياً عند التقاطه ثانية") }
             }
             capNote("يدوي", u, "صُنّف: " + labels[i])
-        }
-        var dlg: AlertDialog? = null
-        val col = LinearLayout(this)
-        col.orientation = LinearLayout.VERTICAL
-        col.setPadding(dp(12), dp(6), dp(12), dp(6))
-        for (i in labels.indices) {
-            val row = LinearLayout(this)
-            row.orientation = LinearLayout.HORIZONTAL
-            row.gravity = Gravity.CENTER_VERTICAL
-            row.setPadding(dp(8), dp(12), dp(8), dp(12))
-            val ic = ImageView(this)
-            ic.setImageResource(icons[i])
-            ic.setColorFilter(cAccent)
-            row.addView(ic, lp(dp(24), dp(24), 0f, 0, 0, 12, 0))
-            row.addView(tv(labels[i], 14f, cText, true), lp(0, WRAP, 1f))
-            row.setOnClickListener { dlg?.dismiss(); apply(i) }
-            col.addView(row, lp(MATCH, WRAP))
-        }
-        dlg = StyledBuilder(this).setTitle("تصنيف الفيديو").setView(col).setNegativeButton("إغلاق", null).show()
+        }.setNegativeButton("إغلاق", null).show()
     }
 
     // الروابط التي استبعدها التطبيق لأنها بدت بثاً مباشراً: تظهر هنا لتصحح الحكم يدوياً
     private fun excludedDialog() {
         val items = ArrayList(excluded.values).reversed()
         if (items.isEmpty()) { toast("لا توجد روابط مستبعدة"); return }
-        val exHolder = arrayOfNulls<AlertDialog>(1)
-        fun pick(i: Int) {
+        val labels = items.map {
+            (if (it.title.isNotBlank()) it.title.take(40) else "فيديو") + "\n" + (Uri.parse(it.u).host ?: "") +
+                (it.meta?.let { m -> " • " + (if (m.vod) "مسجل" else "بث") + " " + m.conf + "% • " + m.why } ?: "")
+        }.toTypedArray()
+        AlertDialog.Builder(this).setTitle("الروابط المستبعدة (" + items.size + ")").setItems(labels) { _, i ->
             val e = items[i]
             val acts = arrayOf("اعتباره مسجلاً وإضافته", "اعتبار كل روابط هذا الموقع مسجلة", "نسخ الرابط")
-            StyledBuilder(this).setTitle("ماذا تريد؟").setItems(acts) { _, k ->
+            AlertDialog.Builder(this).setTitle("ماذا تريد؟").setItems(acts) { _, k ->
                 if (k == 2) { copyText(e.u); return@setItems }
                 setOvr(e.u, if (k == 1) "host" else "url", true)
                 val targets = if (k == 1) items.filter { (Uri.parse(it.u).host ?: "") == (Uri.parse(e.u).host ?: "") } else listOf(e)
@@ -294,18 +273,7 @@ class MainActivity : Activity() {
                 updateCounts()
                 toast("أُضيف إلى التحميلات")
             }.show()
-        }
-        val exRows = items.mapIndexed { i, ex ->
-            DlgStyle.thumbRow(
-                this,
-                if (ex.title.isNotBlank()) ex.title.take(40) else "فيديو",
-                (Uri.parse(ex.u).host ?: "") + (ex.meta?.let { m -> " • " + (if (m.vod) "مسجل" else "بث") + " " + m.conf + "% • " + m.why } ?: ""),
-                null
-            ) { exHolder[0]?.dismiss(); pick(i) }
-        }
-        exHolder[0] = StyledBuilder(this).setTitle("الروابط المستبعدة (" + items.size + ")")
-            .setView(DlgStyle.rowsList(this, exRows))
-            .setNegativeButton("إغلاق", null).show()
+        }.setNegativeButton("إغلاق", null).show()
     }
     private fun capNote(kind: String, u: String, why: String) {
         val line = java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.US).format(java.util.Date()) + "  [" + kind + "]  " + why + "\n" + u.take(220)
@@ -315,10 +283,7 @@ class MainActivity : Activity() {
         val all = synchronized(capLog) { if (capLog.isEmpty()) "لا توجد سجلات بعد. افتح صفحة فيها فيديوهات ثم عد هنا." else capLog.asReversed().joinToString("\n\n") }
         val ls = prefs().getInt("logshow", 0)
         val txt = if (ls > 0) all.split("\n\n").take(ls).joinToString("\n\n") else all
-        val capEmpty = synchronized(capLog) { capLog.isEmpty() }
-        val capB = StyledBuilder(this).setTitle("سجل الالتقاط (لماذا ظهر الرابط أو أُهمل)")
-        if (capEmpty) capB.setMessage(txt) else capB.setView(DlgStyle.logCards(this, txt.split("\n\n")))
-        capB
+        AlertDialog.Builder(this).setTitle("سجل الالتقاط (لماذا ظهر الرابط أو أُهمل)").setMessage(txt)
             .setPositiveButton("نسخ") { _, _ -> copyText(all) }
             .setNeutralButton("مسح") { _, _ -> synchronized(capLog) { capLog.clear() } }
             .setNegativeButton("إغلاق", null).show()
@@ -345,7 +310,6 @@ class MainActivity : Activity() {
         var finalLoc: String? = null
         var finalIsUri = false
         var watch: View? = null
-        var del: View? = null
         // 0 ملتقط، 1 جارٍ، 2 متوقف مؤقتاً، 3 مكتمل، 4 غير مكتمل (أُلغي أو فشل)
         var state = 0
         var removed = false
@@ -509,7 +473,7 @@ class MainActivity : Activity() {
     }
 
     private fun toast(s: String) {
-        DlgStyle.toast(this, s, false)
+        Toast.makeText(this, s, Toast.LENGTH_SHORT).show()
     }
 
     private fun copyText(s: String) {
@@ -1018,41 +982,49 @@ class MainActivity : Activity() {
         col.addView(head, lp(MATCH, WRAP, 0f, 0, 0, 0, 6))
         col.addView(tv("شغّل الفيديو داخل المتصفح وستظهر روابطه هنا ثم اضغط تحميل. الملفات تُحفظ في مجلد التحميلات.", 12f, cMuted), lp(MATCH, WRAP, 0f, 0, 0, 0, 10))
 
-        // شريط الأزرار: عداد ملتقط الروابط (مصغّر برقم أحمر يومض) + التحميلات
+        // الأيقونتان الزرقاوان: عدّاد الروابط وتحميل فيديو التبويب الحالي
         dlActions = LinearLayout(this)
         dlActions.orientation = LinearLayout.HORIZONTAL
-        dlActions.gravity = Gravity.CENTER_VERTICAL
-        badgeBox = LinearLayout(this)
-        badgeBox.orientation = LinearLayout.HORIZONTAL
-        badgeBox.gravity = Gravity.CENTER
-        badgeBox.setPadding(dp(12), dp(6), dp(8), dp(6))
-        badge = tv("عداد ملتقط الروابط", 12f, Color.WHITE, true)
-        badgeNum = tv("0", 12f, Color.WHITE, true)
-        badgeNum.gravity = Gravity.CENTER
-        badgeNum.minWidth = dp(22)
-        badgeNum.setPadding(dp(6), dp(1), dp(6), dp(1))
-        badgeNum.background = bg(Color.parseColor("#E53935"), 11)
-        badgeBox.addView(badge, lp(WRAP, WRAP, 0f, 0, 0, 6, 0))
-        badgeBox.addView(badgeNum, lp(WRAP, WRAP))
-        badgeBox.background = bg(cAccent, 20)
-        badgeBox.visibility = View.GONE
-        badgeBox.setOnClickListener {
-            badgeSeen = true
-            setDlView(1)
+        badge = tv("", 13f, Color.WHITE, true)
+        badge.gravity = Gravity.CENTER
+        badge.background = bg(cAccent, 22)
+        badge.setPadding(dp(16), dp(10), dp(16), dp(10))
+        badge.visibility = View.GONE
+        badge.setOnClickListener {
+            dlFilter = if (activeBox.childCount > 0) 1 else 0
+            updateCounts()
+            dlScroll.smoothScrollTo(0, 0)
         }
-        dlActions.addView(badgeBox, lp(0, MATCH, 1f, 0, 0, 6, 0))
-        tabDl = tv("التحميلات", 12f, Color.WHITE, true)
-        tabDl.gravity = Gravity.CENTER
-        tabDl.setPadding(dp(14), dp(6), dp(14), dp(6))
-        tabDl.background = bg(cAccent, 20, Color.WHITE)
-        tabDl.setOnClickListener { setDlView(0) }
-        dlActions.addView(tabDl, lp(0, MATCH, 1f))
+        dlActions.addView(badge, lp(0, WRAP, 1f, 0, 0, 6, 0))
+        dlFab = tv("⬇ تحميل الفيديو", 14f, Color.WHITE, true)
+        dlFab.gravity = Gravity.CENTER
+        dlFab.background = bg(cAccent, 24)
+        dlFab.setPadding(dp(18), dp(12), dp(18), dp(12))
+        dlFab.visibility = View.GONE
+        dlFab.setOnClickListener { onFabClick() }
+        dlActions.addView(dlFab, lp(0, WRAP, 1f))
+        dlActions.visibility = View.GONE
         col.addView(dlActions, lp(MATCH, WRAP, 0f, 0, 0, 0, 10))
 
-        // شاشة العداد: عدد الملتقطة + زر تحميل الفيديو
-        cntTitle = tv("", 15f, cText, true)
-        cntTitle.visibility = View.GONE
-        col.addView(cntTitle, lp(MATCH, WRAP, 0f, 0, 0, 0, 8))
+        // فلاتر التنظيم
+        val chipsScroll = HorizontalScrollView(this)
+        chipsScroll.isHorizontalScrollBarEnabled = false
+        val chipsRow = LinearLayout(this)
+        chipsRow.orientation = LinearLayout.HORIZONTAL
+        dlChips.clear()
+        for (i in 0 until 5) {
+            val c = tv("", 12f, cAccent, true)
+            c.gravity = Gravity.CENTER
+            c.setPadding(dp(14), dp(7), dp(14), dp(7))
+            c.setOnClickListener {
+                dlFilter = i
+                updateCounts()
+            }
+            dlChips.add(c)
+            chipsRow.addView(c, lp(WRAP, WRAP, 0f, 0, 0, 6, 0))
+        }
+        chipsScroll.addView(chipsRow)
+        col.addView(chipsScroll, lp(MATCH, WRAP, 0f, 0, 0, 0, 12))
 
         activeTitle = tv("جارٍ التحميل الآن", 16f, cAccent, true)
         col.addView(activeTitle, lp(MATCH, WRAP, 0f, 0, 0, 0, 6))
@@ -1083,12 +1055,12 @@ class MainActivity : Activity() {
         return out
     }
 
-    private fun inFilter(r: Row): Boolean = if (dlView == 1) r.state == 0 else true
-
-    private fun setDlView(v: Int) {
-        dlView = v
-        updateCounts()
-        dlScroll.smoothScrollTo(0, 0)
+    private fun inFilter(r: Row): Boolean = when (dlFilter) {
+        1 -> r.state == 1 || r.state == 2
+        2 -> r.state == 3
+        3 -> r.state == 0
+        4 -> r.state == 4
+        else -> true
     }
 
     private fun setState(r: Row, st: Int) {
@@ -1107,7 +1079,6 @@ class MainActivity : Activity() {
             4 -> "غير مكتمل"
             else -> "ملتقط"
         }
-        r.del?.visibility = if (st == 1 || st == 2) View.GONE else View.VISIBLE
         r.chip?.let {
             it.text = tx
             it.setTextColor(c)
@@ -1145,7 +1116,7 @@ class MainActivity : Activity() {
             3 -> "يُزال من القائمة فقط. الملف المحفوظ يبقى في مجلد التحميلات."
             else -> "يُزال من القائمة مع أي أجزاء مؤقتة محفوظة له."
         }
-        StyledBuilder(this)
+        AlertDialog.Builder(this)
             .setTitle("حذف التحميل")
             .setMessage(msg)
             .setPositiveButton("حذف") { _, _ -> deleteRow(c) }
@@ -1603,7 +1574,7 @@ class MainActivity : Activity() {
             et.minLines = 4
             et.gravity = Gravity.TOP
             et.layoutDirection = View.LAYOUT_DIRECTION_LTR
-            StyledBuilder(this).setTitle("رؤوس HTTP مخصصة").setView(et)
+            AlertDialog.Builder(this).setTitle("رؤوس HTTP مخصصة").setView(et)
                 .setPositiveButton("حفظ") { _, _ -> prefs().edit().putString("customhdr", et.text.toString()).apply(); toast("تم الحفظ") }
                 .setNegativeButton("إلغاء", null).show()
         }
@@ -1692,48 +1663,6 @@ class MainActivity : Activity() {
         val on = cur?.start == true
         startView.visibility = if (on) View.VISIBLE else View.GONE
         if (on) refreshStart()
-    }
-
-    private fun favFile(h: String): java.io.File {
-        val dir = java.io.File(cacheDir, "fav")
-        dir.mkdirs()
-        return java.io.File(dir, h.replace(Regex("[^A-Za-z0-9._-]"), "_") + ".png")
-    }
-
-    private fun saveFav(h: String, b: android.graphics.Bitmap) {
-        try {
-            val f = favFile(h)
-            if (f.exists()) return
-            previewPool.execute {
-                try {
-                    java.io.FileOutputStream(f).use { b.compress(android.graphics.Bitmap.CompressFormat.PNG, 100, it) }
-                } catch (e: Throwable) {
-                }
-            }
-        } catch (e: Throwable) {
-        }
-    }
-
-    // شعار الموقع: من الذاكرة أولاً ثم من الملف المحفوظ، فيبقى ظاهراً بعد إعادة تشغيل التطبيق
-    private fun favOf(u: String): android.graphics.Bitmap? {
-        val h = try { Uri.parse(u).host } catch (e: Throwable) { null }
-        val hit = (if (h != null) favCache[h] else null) ?: favCache[hostOf(u)]
-        if (hit != null) return hit
-        val key = h ?: hostOf(u)
-        return try {
-            val f = favFile(key)
-            if (f.exists()) android.graphics.BitmapFactory.decodeFile(f.absolutePath)?.also { favCache[key] = it } else null
-        } catch (e: Throwable) {
-            null
-        }
-    }
-
-    private fun candThumb(c: Cand): android.graphics.Bitmap? {
-        return try {
-            if (c.rw.thumbSet) (c.rw.thumb?.drawable as? android.graphics.drawable.BitmapDrawable)?.bitmap else null
-        } catch (e: Throwable) {
-            null
-        }
     }
 
     private fun hostOf(u: String): String = Uri.parse(u).host?.removePrefix("www.") ?: u.take(20)
@@ -1885,7 +1814,7 @@ class MainActivity : Activity() {
     }
 
     private fun confirmDelete(name: String, ok: () -> Unit) {
-        StyledBuilder(this)
+        AlertDialog.Builder(this)
             .setTitle(name)
             .setMessage("حذف هذا العنصر؟")
             .setPositiveButton("حذف") { _, _ -> ok() }
@@ -1971,7 +1900,7 @@ class MainActivity : Activity() {
         u.inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI
         box.addView(n, lp(MATCH, WRAP))
         box.addView(u, lp(MATCH, WRAP))
-        StyledBuilder(this)
+        AlertDialog.Builder(this)
             .setTitle("إضافة اختصار")
             .setView(box)
             .setPositiveButton("حفظ") { _, _ ->
@@ -1994,28 +1923,21 @@ class MainActivity : Activity() {
 
     private fun showShortcuts() {
         val l = loadShortcuts()
-        val b = StyledBuilder(this).setTitle("الاختصارات (" + l.size + ")")
-        val scHolder = arrayOfNulls<AlertDialog>(1)
-        if (l.isEmpty()) b.setMessage("لا توجد اختصارات") else {
-            val rows = l.mapIndexed { i, sc ->
-                val r = DlgStyle.siteRow(this, sc.first, hostOf(sc.second), favOf(sc.second)) { scHolder[0]?.dismiss(); load(sc.second) }
-                r.setOnLongClickListener {
-                    scHolder[0]?.dismiss()
-                    confirmDelete(l[i].first) {
-                        val x = loadShortcuts()
-                        if (i < x.size) x.removeAt(i)
-                        saveShortcuts(x)
-                        refreshStart()
-                    }
-                    true
-                }
-                r
-            }
-            b.setView(DlgStyle.rowsList(this, rows))
-        }
+        val b = AlertDialog.Builder(this).setTitle("الاختصارات (" + l.size + ")")
+        if (l.isEmpty()) b.setMessage("لا توجد اختصارات") else b.setItems(Array(l.size) { i -> l[i].first + "\n" + hostOf(l[i].second) }) { _, i -> load(l[i].second) }
         b.setPositiveButton("إضافة") { _, _ -> addShortcutDialog() }
         b.setNegativeButton("رجوع", null)
-        scHolder[0] = b.show()
+        val dlg = b.show()
+        if (l.isNotEmpty()) dlg.listView.setOnItemLongClickListener { _, _, i, _ ->
+            dlg.dismiss()
+            if (i in l.indices) confirmDelete(l[i].first) {
+                val x = loadShortcuts()
+                if (i < x.size) x.removeAt(i)
+                saveShortcuts(x)
+                refreshStart()
+            }
+            true
+        }
     }
 
     // ---------- سجل التصفح ----------
@@ -2053,7 +1975,6 @@ class MainActivity : Activity() {
     private fun showHistory() {
         val urls = ArrayList<String>()
         val labels = ArrayList<String>()
-        val hNames = ArrayList<String>()
         try {
             val f = histFile()
             if (f.exists()) {
@@ -2065,25 +1986,18 @@ class MainActivity : Activity() {
                     val t = p[1].ifBlank { hostOf(u) }
                     urls.add(u)
                     labels.add(t.take(50) + "\n" + u.take(60))
-                    hNames.add(t.take(50))
                 }
             }
         } catch (e: Throwable) {
         }
-        val b = StyledBuilder(this).setTitle("سجل التصفح (" + urls.size + ")")
-        val hiHolder = arrayOfNulls<AlertDialog>(1)
-        if (urls.isEmpty()) b.setMessage("السجل فارغ") else {
-            val rows = urls.mapIndexed { i, hu ->
-                DlgStyle.siteRow(this, hNames[i], hu.take(60), favOf(hu)) { hiHolder[0]?.dismiss(); load(hu) }
-            }
-            b.setView(DlgStyle.rowsList(this, rows))
-        }
+        val b = AlertDialog.Builder(this).setTitle("سجل التصفح (" + urls.size + ")")
+        if (urls.isEmpty()) b.setMessage("السجل فارغ") else b.setItems(labels.toTypedArray()) { _, i -> load(urls[i]) }
         if (urls.isNotEmpty()) b.setNeutralButton("مسح السجل") { _, _ ->
             clearHistory()
             toast("تم مسح السجل")
         }
         b.setNegativeButton("رجوع", null)
-        hiHolder[0] = b.show()
+        b.show()
     }
 
     // ---------- البحث داخل الصفحة ----------
@@ -2213,10 +2127,7 @@ class MainActivity : Activity() {
                 val h = try { Uri.parse(v.url ?: "").host } catch (e: Throwable) { null }
                 if (h != null) {
                     val old = favCache[h]
-                    if (old == null || icon.width >= old.width) {
-                        favCache[h] = icon
-                        saveFav(h, icon)
-                    }
+                    if (old == null || icon.width >= old.width) favCache[h] = icon
                 }
             }
 
@@ -3328,7 +3239,7 @@ class MainActivity : Activity() {
             "\nحد السرعة: " + (if (lim > 0) "" + lim + " ك.ب/ث" else "بلا حد") +
             "\nالتحميلات المتزامنة: " + prefs().getInt("parallel", 3) +
             "\nالأجزاء المتوازية: " + prefs().getInt("threads", 8)
-        StyledBuilder(this).setTitle("تقرير الأداء").setView(DlgStyle.kvText(this, msg))
+        AlertDialog.Builder(this).setTitle("تقرير الأداء").setMessage(msg)
             .setPositiveButton("تفريغ الذاكرة") { _, _ -> freeMem() }
             .setNegativeButton("رجوع", null).show()
     }
@@ -3489,7 +3400,7 @@ class MainActivity : Activity() {
             cb.setOnCheckedChangeListener { _, on -> et.visibility = if (on) View.GONE else View.VISIBLE }
             if (zeroLabel.isNotEmpty()) box.addView(cb)
             box.addView(et)
-            StyledBuilder(this).setTitle(title).setView(box)
+            AlertDialog.Builder(this).setTitle(title).setView(box)
                 .setPositiveButton("حفظ") { _, _ ->
                     val n = if (zeroLabel.isNotEmpty() && cb.isChecked) 0 else (et.text.toString().trim().toLongOrNull() ?: def.toLong()).coerceIn(1L, Int.MAX_VALUE.toLong()).toInt()
                     prefs().edit().putInt(key, n).apply()
@@ -3522,7 +3433,7 @@ class MainActivity : Activity() {
         val idx = values.indexOf(cur0)
         val holder = arrayOfNulls<TextView>(1)
         val p = pill(labels[if (idx >= 0) idx else 0], false) {
-            StyledBuilder(this).setTitle(title).setItems(labels) { _, i ->
+            AlertDialog.Builder(this).setTitle(title).setItems(labels) { _, i ->
                 prefs().edit().putInt(key, values[i]).apply()
                 holder[0]?.text = labels[i]
                 onChange(values[i])
@@ -3624,26 +3535,19 @@ class MainActivity : Activity() {
 
     private fun showBookmarks() {
         val items = bookmarkList()
-        val b = StyledBuilder(this).setTitle("المفضلة (" + items.size + ")")
-        val bmHolder = arrayOfNulls<AlertDialog>(1)
-        if (items.isEmpty()) b.setMessage("لا توجد صفحات في المفضلة بعد") else {
-            val rows = items.map { u ->
-                val r = DlgStyle.siteRow(this, hostOf(u), u, favOf(u)) { bmHolder[0]?.dismiss(); load(u) }
-                r.setOnLongClickListener {
-                    removeBookmark(u)
-                    bmHolder[0]?.dismiss()
-                    true
-                }
-                r
-            }
-            b.setView(DlgStyle.rowsList(this, rows))
-        }
+        val b = AlertDialog.Builder(this).setTitle("المفضلة (" + items.size + ")")
+        if (items.isEmpty()) b.setMessage("لا توجد صفحات في المفضلة بعد") else b.setItems(items.toTypedArray()) { _, i -> load(items[i]) }
         b.setPositiveButton("حفظ الصفحة الحالية") { _, _ -> addBookmark() }
         if (items.isNotEmpty()) b.setNegativeButton("مسح الكل") { _, _ ->
             prefs().edit().remove("bm").apply()
             refreshStart()
         }
-        bmHolder[0] = b.show()
+        val dlg = b.show()
+        if (items.isNotEmpty()) dlg.listView.setOnItemLongClickListener { _, _, i, _ ->
+            if (i in items.indices) removeBookmark(items[i])
+            dlg.dismiss()
+            true
+        }
     }
 
     // ---------- تنبيهات التطبيق ----------
@@ -3824,13 +3728,10 @@ class MainActivity : Activity() {
             toast("لا توجد صفحات مغلقة محفوظة")
             return
         }
-        val clHolder = arrayOfNulls<AlertDialog>(1)
-        val rows = closed.mapIndexed { i, cp ->
-            DlgStyle.siteRow(this, (if (cp.title.isNotBlank()) cp.title else cp.url).take(60), hostOf(cp.url), favOf(cp.url)) { clHolder[0]?.dismiss(); reopen(closed[i]) }
-        }
-        clHolder[0] = StyledBuilder(this)
+        val items = closed.map { (if (it.title.isNotBlank()) it.title else it.url).take(60) }.toTypedArray()
+        AlertDialog.Builder(this)
             .setTitle("الصفحات المغلقة مؤخراً")
-            .setView(DlgStyle.rowsList(this, rows))
+            .setItems(items) { _, i -> reopen(closed[i]) }
             .setNegativeButton("مسح الكل") { _, _ ->
                 for (x in closed) stateFile(x.id).delete()
                 closed.clear()
@@ -3859,7 +3760,7 @@ class MainActivity : Activity() {
             val o = a.getJSONObject(i)
             (if (o.optBoolean("on", true)) "✔ " else "✖ ") + o.optString("name", "بدون اسم")
         }
-        StyledBuilder(this)
+        AlertDialog.Builder(this)
             .setTitle("سكربتات JavaScript")
             .setItems(names) { _, i -> editScript(i) }
             .setPositiveButton("إضافة") { _, _ -> editScript(-1) }
@@ -3896,7 +3797,7 @@ class MainActivity : Activity() {
         val sv = ScrollView(this)
         sv.addView(lay)
         val on = o.optBoolean("on", true)
-        val b = StyledBuilder(this)
+        val b = AlertDialog.Builder(this)
             .setTitle(if (idx >= 0) "تعديل السكربت" else "سكربت جديد")
             .setView(sv)
             .setPositiveButton("حفظ") { _, _ ->
@@ -4104,7 +4005,7 @@ class MainActivity : Activity() {
         val src = hit.extra ?: return false
         if (src.isBlank()) return false
         val pg = w.url ?: ""
-        StyledBuilder(this)
+        AlertDialog.Builder(this)
             .setTitle("الصورة")
             .setItems(arrayOf("نسخ الرابط", "مشاركة الرابط", "تحميل الصورة")) { _, i ->
                 when (i) {
@@ -4525,22 +4426,13 @@ class MainActivity : Activity() {
     }
 
     private fun chooseQuality(vs: List<Variant>, u: String, h: Map<String, String>, r: Row) {
-        val qLabels = ArrayList<String>()
-        val qSizes = ArrayList<String>()
+        val items = ArrayList<String>()
         val dur = cands[u]?.meta?.dur ?: -1.0
-        qLabels.add("الأعلى جودة (تلقائي)")
-        qSizes.add("")
-        for (v in vs) {
-            qLabels.add(v.label)
-            qSizes.add(if (dur > 0 && v.bw > 0) "≈ " + fmtSize(v.bw * dur / 8.0) else "")
-        }
-        val qHolder = arrayOfNulls<AlertDialog>(1)
-        val qRows = qLabels.indices.map { i ->
-            DlgStyle.qualityRow(this, qLabels[i], qSizes[i]) { qHolder[0]?.dismiss(); enqueue(if (i == 0) u else vs[i - 1].url, h, r) }
-        }
-        qHolder[0] = StyledBuilder(this)
+        items.add("الأعلى جودة (تلقائي)")
+        for (v in vs) items.add(v.label + (if (dur > 0 && v.bw > 0) " • ≈ " + fmtSize(v.bw * dur / 8.0) else ""))
+        AlertDialog.Builder(this)
             .setTitle("اختر الجودة")
-            .setView(DlgStyle.rowsList(this, qRows))
+            .setItems(items.toTypedArray()) { _, i -> enqueue(if (i == 0) u else vs[i - 1].url, h, r) }
             .setOnCancelListener {
                 r.msg.text = ""
                 r.btn.isEnabled = true
@@ -5164,29 +5056,32 @@ deep();
 
     private fun updateCounts() {
         val n = found.size
-        // الوميض الأحمر عند التقاط فيديو جديد فقط، ويتوقف بفتح العداد
-        if (n > lastFound) badgeSeen = (dlView == 1)
-        lastFound = n
-        badgeBox.visibility = if (n > 0) View.VISIBLE else View.GONE
-        badgeNum.text = n.toString()
-        if (badgeSeen) { badgeNum.clearAnimation(); badgeNum.alpha = 1f }
-        else if (badgeNum.animation == null) {
-            val an = android.view.animation.AlphaAnimation(1f, 0.25f)
-            an.duration = 600
-            an.repeatMode = android.view.animation.Animation.REVERSE
-            an.repeatCount = android.view.animation.Animation.INFINITE
-            badgeNum.startAnimation(an)
-        }
-        badgeBox.background = if (dlView == 1) bg(cAccent, 20, Color.WHITE) else bg(cAccent, 20)
-        tabDl.background = if (dlView == 0) bg(cAccent, 20, Color.WHITE) else bg(cAccent, 20)
-        dlActions.visibility = if (n > 0) View.VISIBLE else View.GONE
+        val bc = candsOf(cur).size
+        badge.visibility = if (n > 0) View.VISIBLE else View.GONE
+        badge.text = "عداد ملتقط الروابط ($n)"
+        dlFab.visibility = if (bc > 0) View.VISIBLE else View.GONE
+        dlFab.text = if (bc > 1) "⬇ تحميل الفيديو ($bc)" else "⬇ تحميل الفيديو"
+        dlActions.visibility = if (n > 0 || bc > 0) View.VISIBLE else View.GONE
         val act = activeBox.childCount
         navItems[1].second.text = if (act > 0) "جارٍ ($act)" else if (n > 0) "التحميلات ($n)" else "التحميلات"
 
+        // فلترة الصفوف وتحديث الأقسام
         val rows = allRows()
-        val capN = rows.count { it.state == 0 }
-        cntTitle.text = "الفيديوهات الملتقطة ($capN)"
-        cntTitle.visibility = if (dlView == 1) View.VISIBLE else View.GONE
+        val cnt = IntArray(5)
+        for (r in rows) {
+            cnt[0]++
+            when (r.state) {
+                1, 2 -> cnt[1]++
+                3 -> cnt[2]++
+                0 -> cnt[3]++
+                4 -> cnt[4]++
+            }
+        }
+        val names = arrayOf("الكل", "جارية", "مكتملة", "ملتقطة", "غير مكتملة")
+        for (i in dlChips.indices) {
+            dlChips[i].text = names[i] + " (" + cnt[i] + ")"
+            styleChip(dlChips[i], i == dlFilter)
+        }
         var visAct = 0
         var visList = 0
         for (r in rows) {
@@ -5199,7 +5094,14 @@ deep();
         listTitle.visibility = if (visList > 0) View.VISIBLE else View.GONE
         val none = visAct + visList == 0
         emptyTv.visibility = if (none) View.VISIBLE else View.GONE
-        emptyTv.text = if (dlView == 1) "لا توجد فيديوهات ملتقطة" else "لا توجد روابط ملتقطة بعد"
+        emptyTv.text = when {
+            rows.isEmpty() -> "لا توجد روابط ملتقطة بعد"
+            dlFilter == 1 -> "لا توجد تحميلات جارية"
+            dlFilter == 2 -> "لا توجد تحميلات مكتملة"
+            dlFilter == 3 -> "لا توجد فيديوهات ملتقطة بانتظار التحميل"
+            dlFilter == 4 -> "لا توجد تحميلات غير مكتملة"
+            else -> "لا توجد روابط ملتقطة بعد"
+        }
         if (navItems.size > 4) navItems[4].second.text = if (alerts.isNotEmpty()) "التنبيهات (" + alerts.size + ")" else "التنبيهات"
         alertEmpty.visibility = if (alerts.isNotEmpty()) View.GONE else View.VISIBLE
     }
@@ -5277,6 +5179,24 @@ deep();
         }
         go()
         toast("تابع التحميل من تبويب التحميلات")
+    }
+
+    private fun onFabClick() {
+        val cs = candsOf(cur)
+        if (cs.isEmpty()) {
+            updateCounts()
+            toast("شغّل الفيديو لحظة ثم اضغط مرة أخرى")
+            return
+        }
+        if (cs.size == 1) {
+            startCand(cs[0])
+            return
+        }
+        val ordered = cs.reversed()
+        AlertDialog.Builder(this)
+            .setTitle("اختر الفيديو")
+            .setItems(ordered.map { it.title }.toTypedArray()) { _, i -> startCand(ordered[i]) }
+            .show()
     }
 
     // ---------- حفظ مهام التنزيل واستعادتها (كل مهمة مستقلة) ----------
@@ -5729,18 +5649,12 @@ deep();
         previewPool.execute {
             val st = items.map { OfflineDrm.remainingText(this, it) }
             ui.post {
-                val ofHolder = arrayOfNulls<AlertDialog>(1)
-                val ofRows = items.mapIndexed { i, it ->
-                    DlgStyle.thumbRow(
-                        this,
-                        if (it.name.isBlank()) "فيديو محمي" else it.name,
-                        fmtSize(it.bytes.toDouble()) + "  •  الترخيص: " + st[i],
-                        null
-                    ) { ofHolder[0]?.dismiss(); offlineItemDialog(items[i], st[i]) }
+                val names = items.mapIndexed { i, it ->
+                    (if (it.name.isBlank()) "فيديو محمي" else it.name) + "\n" + fmtSize(it.bytes.toDouble()) + "  •  الترخيص: " + st[i]
                 }
-                ofHolder[0] = StyledBuilder(this)
+                AlertDialog.Builder(this)
                     .setTitle("المحمية — دون اتصال")
-                    .setView(DlgStyle.rowsList(this, ofRows))
+                    .setItems(names.toTypedArray()) { _, i -> offlineItemDialog(items[i], st[i]) }
                     .setNegativeButton("إغلاق", null)
                     .show()
             }
@@ -5752,9 +5666,9 @@ deep();
             "• يعمل داخل مشغّل التطبيق فقط وبترخيص صالح.\n" +
             "• حالة الترخيص الآن: " + status + "\n" +
             "• عند انتهاء الترخيص يلزم اتصال وقبول من المنصة لتجديده، وإلا لا يعمل."
-        StyledBuilder(this)
+        AlertDialog.Builder(this)
             .setTitle(if (it.name.isBlank()) "فيديو محمي" else it.name)
-            .setView(DlgStyle.bulletText(this, msg))
+            .setMessage(msg)
             .setPositiveButton("تشغيل") { _, _ -> playOffline(it.id) }
             .setNeutralButton("تجديد الترخيص") { _, _ ->
                 toast("جاري طلب التجديد من المنصة...")
@@ -6034,7 +5948,7 @@ deep();
         return out
     }
 
-    // التشغيل عبر المشغّل المدمج (Media3) المخصص لتبويب التحميلات
+    // التشغيل عبر المشغّل المدمج (Media3 / LibVLC) المخصص لتبويب التحميلات
     private fun playVideo(src: String, isUri: Boolean, engine: Int = 0) {
         val i = Intent(this, VideoPlayerActivity::class.java)
         if (engine != 0) i.putExtra(VideoPlayerActivity.X_ENGINE, engine)
@@ -6357,8 +6271,8 @@ deep();
             cands[u]?.rw?.let { setState(it, if (ctl.paused) 2 else 1) }
         }
         cancelB.setOnClickListener {
-            // إلغاء التحميل = إيقاف العملية الجارية وحذفها من القائمة
-            cands[u]?.let { deleteRow(it) }
+            ctl.cancelled = true
+            msg.text = "جاري الإلغاء..."
         }
         val rw = Row(bar, msg, btn, pauseB, cancelB, ctl, row)
         rw.url = u
@@ -6368,10 +6282,7 @@ deep();
         rw.quiet = restore != null
         val go: () -> Unit = {
             if (!btn.isEnabled) toast("قيد التحميل أو تم تحميله")
-            else {
-                startDl(u, h, rw)
-                if (dlView == 1) setDlView(0)
-            }
+            else startDl(u, h, rw)
         }
         btn.setOnClickListener { go() }
         foundStart[u] = go
@@ -6384,8 +6295,7 @@ deep();
         val watchB = pill("▶ مشاهدة", false) { watchRow(rw) }
         watchB.visibility = View.GONE
         rw.watch = watchB
-        val delB = pill("إلغاء", false) { cands[u]?.let { deleteDialog(it) } }
-        rw.del = delB
+        val delB = pill("🗑 حذف", false) { cands[u]?.let { deleteDialog(it) } }
         val classB = pill("تصنيف", false) { cands[u]?.let { classifyDialog(it) } }
 
         // السطر الأول: اسم الفيديو وحالته
@@ -6402,15 +6312,15 @@ deep();
         // أزرار التحميل (أساسية) ثم أزرار الأدوات (ثانوية)
         val btns = LinearLayout(this)
         btns.orientation = LinearLayout.HORIZONTAL
-        btns.addView(btn, lp(0, MATCH, 1f, 0, 0, 6, 0))
-        btns.addView(pauseB, lp(0, MATCH, 1f, 0, 0, 6, 0))
-        btns.addView(cancelB, lp(0, MATCH, 1f))
+        btns.addView(btn, lp(0, WRAP, 1f, 0, 0, 6, 0))
+        btns.addView(pauseB, lp(0, WRAP, 1f, 0, 0, 6, 0))
+        btns.addView(cancelB, lp(0, WRAP, 1f))
         val btns2 = LinearLayout(this)
         btns2.orientation = LinearLayout.HORIZONTAL
-        btns2.addView(watchB, lp(0, MATCH, 1f, 0, 0, 6, 0))
-        btns2.addView(copy, lp(0, MATCH, 1f, 0, 0, 6, 0))
-        btns2.addView(classB, lp(0, MATCH, 1f, 0, 0, 6, 0))
-        btns2.addView(delB, lp(0, MATCH, 1f))
+        btns2.addView(watchB, lp(0, WRAP, 1f, 0, 0, 6, 0))
+        btns2.addView(copy, lp(0, WRAP, 1f, 0, 0, 6, 0))
+        btns2.addView(classB, lp(0, WRAP, 1f, 0, 0, 6, 0))
+        btns2.addView(delB, lp(0, WRAP, 1f))
 
         // الصورة المصغّرة (أيقونة افتراضية حتى تتوفر صورة) وبجانبها الاسم والمصدر وحالة الحماية والصيغة
         val thumb = ImageView(this)
@@ -7881,7 +7791,7 @@ deep();
             try { r.grant(r.resources) } catch (e: Throwable) {}
             return
         }
-        StyledBuilder(this).setTitle("إذن الموقع")
+        AlertDialog.Builder(this).setTitle("إذن الموقع")
             .setMessage((r.origin.host ?: "الموقع") + " يطلب استخدام " + names.joinToString(" و "))
             .setPositiveButton("سماح") { _, _ ->
                 val miss = need.filter { Build.VERSION.SDK_INT >= 23 && checkSelfPermission(it) != android.content.pm.PackageManager.PERMISSION_GRANTED }
@@ -8014,15 +7924,8 @@ deep();
     // ---------- التحكم الحر بالسرعة ----------
 
     private fun labeledSeek(col: LinearLayout, title: String, min: Int, max: Int, start: Int, fmt: (Int) -> String, onStop: (Int) -> Unit): SeekBar {
-        val hdr = LinearLayout(this)
-        hdr.orientation = LinearLayout.HORIZONTAL
-        hdr.gravity = Gravity.CENTER_VERTICAL
-        hdr.addView(tv(title, 13f, cText, true), lp(0, WRAP, 1f))
-        val t = tv(fmt(start), 12f, cAccent, true)
-        t.background = bg(cBg, 12, cLine)
-        t.setPadding(dp(9), dp(2), dp(9), dp(2))
-        hdr.addView(t, lp(WRAP, WRAP))
-        col.addView(hdr, lp(MATCH, WRAP, 0f, 0, 10, 0, 2))
+        val t = tv(title + ": " + fmt(start), 13f, cText, true)
+        col.addView(t, lp(MATCH, WRAP, 0f, 0, 10, 0, 2))
         val s = SeekBar(this)
         s.max = max - min
         s.progress = (start - min).coerceIn(0, max - min)
@@ -8030,7 +7933,7 @@ deep();
         s.thumbTintList = ColorStateList.valueOf(cAccent)
         s.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
             override fun onProgressChanged(sb: SeekBar, p: Int, u: Boolean) {
-                t.text = fmt(p + min)
+                t.text = title + ": " + fmt(p + min)
             }
 
             override fun onStartTrackingTouch(sb: SeekBar) {}
@@ -8069,7 +7972,7 @@ deep();
         col.addView(tv("الاتصالات تُقلَّل تلقائياً للملفات الصغيرة حتى لا تُهدر.", 11f, cMuted), lp(MATCH, WRAP, 0f, 0, 10, 0, 0))
         val sv = ScrollView(this)
         sv.addView(col)
-        StyledBuilder(this).setTitle("التحكم بالسرعة").setView(sv)
+        AlertDialog.Builder(this).setTitle("التحكم بالسرعة").setView(sv)
             .setPositiveButton("حفظ") { _, _ ->
                 val v = if (noLim.isChecked) 0 else (lim.text.toString().trim().toLongOrNull() ?: 1024L).coerceIn(1L, 10000000L).toInt()
                 prefs().edit().putInt("limitkb", v).putInt("threads", sT.progress + 1).putInt("parallel", sP.progress + 1).apply()
@@ -8128,14 +8031,14 @@ deep();
             }
             ui.post {
                 if (rec == 0) {
-                    StyledBuilder(this).setTitle("نتيجة القياس")
+                    AlertDialog.Builder(this).setTitle("نتيجة القياس")
                         .setMessage("لم أتمكن من القياس (الشبكة بطيئة جداً أو منقطعة). التطبيق يعمل مع الشبكات الضعيفة بمهل طويلة وإعادة محاولة تلقائية.")
                         .setPositiveButton("حسناً", null).show()
                 } else {
                     val mb = String.format(java.util.Locale.US, "%.2f", bps / 1048576.0)
                     val mbit = String.format(java.util.Locale.US, "%.1f", bps * 8 / 1000000.0)
-                    StyledBuilder(this).setTitle("نتيجة القياس")
-                        .setView(DlgStyle.kvText(this, "السرعة: " + mb + " م.ب/ث (" + mbit + " ميغابت/ث)\nعدد الاتصالات المقترح: " + rec))
+                    AlertDialog.Builder(this).setTitle("نتيجة القياس")
+                        .setMessage("السرعة: " + mb + " م.ب/ث (" + mbit + " ميغابت/ث)\nعدد الاتصالات المقترح: " + rec)
                         .setPositiveButton("تطبيق المقترح") { _, _ ->
                             prefs().edit().putInt("threads", rec).apply()
                             toast("تم ضبط الاتصالات على " + rec)
@@ -8160,7 +8063,7 @@ deep();
         box.setBackgroundColor(cCard)
         box.setPadding(dp(18), dp(10), dp(18), dp(10))
         box.addView(et, lp(MATCH, WRAP))
-        StyledBuilder(this).setTitle("فحص رابط").setView(box)
+        AlertDialog.Builder(this).setTitle("فحص رابط").setView(box)
             .setPositiveButton("فحص") { _, _ ->
                 val u = et.text.toString().trim()
                 if (!(u.startsWith("http://") || u.startsWith("https://"))) {
@@ -8190,7 +8093,7 @@ deep();
                     }
                     val m = msg
                     ui.post {
-                        StyledBuilder(this).setTitle("نتيجة الفحص").setView(DlgStyle.kvText(this, m))
+                        AlertDialog.Builder(this).setTitle("نتيجة الفحص").setMessage(m)
                             .setPositiveButton("إضافة للتحميلات") { _, _ ->
                                 val h = HashMap<String, String>()
                                 h["User-Agent"] = curUa
@@ -8222,7 +8125,7 @@ deep();
         box.setBackgroundColor(cCard)
         box.setPadding(dp(18), dp(10), dp(18), dp(10))
         box.addView(et, lp(MATCH, WRAP))
-        StyledBuilder(this).setTitle("تحميل دفعة روابط").setView(box)
+        AlertDialog.Builder(this).setTitle("تحميل دفعة روابط").setView(box)
             .setPositiveButton("بدء التحميل") { _, _ ->
                 val urls = Regex("https?://[^\\s\"'<>]+").findAll(et.text.toString()).map { it.value }.distinct().toList()
                 if (urls.isEmpty()) {
@@ -8359,28 +8262,23 @@ deep();
                 }
                 for (id in ids) {
                     val label = sizeIds[id]?.second ?: id
-                    val gi = LinearLayout(this)
-                    gi.orientation = LinearLayout.VERTICAL
-                    gi.background = bg(Color.TRANSPARENT, 12, cLine)
-                    gi.setPadding(dp(10), dp(4), dp(10), dp(8))
-                    gi.addView(tv("▪ " + label, 13f, cText, true), lp(MATCH, WRAP, 0f, 0, 6, 0, 0))
-                    labeledSeek(gi, "الزر", 30, 300, pctB(id), { "$it%" }) { v ->
+                    col.addView(tv("▪ " + label, 13f, cText, true), lp(MATCH, WRAP, 0f, 0, 12, 0, 0))
+                    labeledSeek(col, "الزر", 30, 300, pctB(id), { "$it%" }) { v ->
                         prefs().edit().putInt("szb_" + id, v).apply()
                         applySizes()
                     }
                     if (id !in noIconIds) {
-                        labeledSeek(gi, "الأيقونة", 30, 300, pctI(id), { "$it%" }) { v ->
+                        labeledSeek(col, "الأيقونة", 30, 300, pctI(id), { "$it%" }) { v ->
                             prefs().edit().putInt("szi_" + id, v).apply()
                             applySizes()
                         }
                     }
-                    col.addView(gi, lp(MATCH, WRAP, 0f, 0, 8, 0, 0))
                 }
             }
             sv.post { sv.scrollTo(0, keepY) }
         }
         fill()
-        StyledBuilder(this).setTitle("أحجام الأزرار والأيقونات").setView(sv)
+        AlertDialog.Builder(this).setTitle("أحجام الأزرار والأيقونات").setView(sv)
             .setPositiveButton("تم", null)
             .setNeutralButton("إعادة الضبط") { _, _ ->
                 val e = prefs().edit()

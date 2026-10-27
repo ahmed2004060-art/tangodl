@@ -9,28 +9,15 @@ android {
         applicationId "com.tangodl"
         minSdk 24
         targetSdk 34
-        // versionCode يزيد تلقائياً مع كل بناء في GitHub Actions حتى يُقبل التحديث فوق النسخة المثبتة
-        def runNo = (System.getenv("GITHUB_RUN_NUMBER") ?: "0").toInteger()
-        versionCode 100 + runNo
-        versionName "1.14." + runNo
+        versionCode 15
+        versionName "1.14"
+        ndk { abiFilters "arm64-v8a" }
     }
-    // مفتاح توقيع ثابت داخل المشروع (يمكن تجاوزه بأسرار GitHub إن وُجدت)
-    def ksFile = System.getenv("KEYSTORE_FILE") ?: "tangodl.keystore"
-    def ksPass = System.getenv("KEYSTORE_PASSWORD") ?: "fc2db076a5ae2cf4603450be"
-    signingConfigs {
-        shared {
-            storeFile file(ksFile)
-            storePassword ksPass
-            keyAlias "tangodl"
-            keyPassword ksPass
-            enableV1Signing true
-            enableV2Signing true
-        }
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
     }
-    buildTypes {
-        debug { signingConfig signingConfigs.shared }
-        release { signingConfig signingConfigs.shared }
-    }
+    kotlinOptions { jvmTarget = "17" }
 }
 dependencies {
     implementation 'com.googlecode.mp4parser:isoparser:1.1.22'
@@ -41,4 +28,5 @@ dependencies {
     implementation 'androidx.media3:media3-exoplayer:1.4.1'
     implementation 'androidx.media3:media3-exoplayer-hls:1.4.1'
     implementation 'androidx.media3:media3-exoplayer-dash:1.4.1'
+    implementation 'org.videolan.android:libvlc-all:3.6.0'
 }
