@@ -257,6 +257,12 @@ class VideoPlayerActivity : Activity() {
         return v
     }
 
+    // نفس ضبط المعاينة: الإيقاف في المنتصف، ومثلث التشغيل يُزاح لليمين قليلاً ليبدو متوسطاً
+    private fun setPlayIcon(playing: Boolean) {
+        playBtn.text = if (playing) "❚❚" else "▶"
+        playBtn.translationX = if (playing) 0f else 2.7f * resources.displayMetrics.density
+    }
+
     // حبّة زجاجية (للمحرك والجودة)
     private fun pillBtn(t: String, onClick: (() -> Unit)?): TextView {
         val v = TextView(this)
@@ -518,6 +524,9 @@ class VideoPlayerActivity : Activity() {
         bar.gravity = Gravity.CENTER_VERTICAL
         bar.setPadding(dp(12), dp(8), dp(12), dp(8))
         playBtn = iconBtn("▶", 40, 18f) { togglePlay() }
+        // الرمز كان أخفض من مركز الدائرة بنحو 4% من قطرها (مقاس من لقطة الشاشة)، فيُرفع قليلاً
+        playBtn.translationY = -1.5f * resources.displayMetrics.density
+        setPlayIcon(false)
         tCur = timeText("00:00")
         tTot = timeText("00:00")
         seek = SeekBar(this)
@@ -702,7 +711,7 @@ class VideoPlayerActivity : Activity() {
     }
 
     private fun toast(s: String) {
-        try { Toast.makeText(this, s, Toast.LENGTH_SHORT).show() } catch (e: Throwable) {}
+        try { DlgStyle.toast(this, s, false) } catch (e: Throwable) {}
     }
 
     private fun fmt(ms: Long): String {
@@ -831,7 +840,7 @@ class VideoPlayerActivity : Activity() {
     private fun fail(msg: String) {
         releaseExo()
         host.removeAllViews()
-        playBtn.text = "▶"
+        setPlayIcon(false)
         showStatus(msg)
     }
 
@@ -895,7 +904,7 @@ class VideoPlayerActivity : Activity() {
                 }
 
                 override fun onIsPlayingChanged(isPlaying: Boolean) {
-                    playBtn.text = if (isPlaying) "❚❚" else "▶"
+                    setPlayIcon(isPlaying)
                 }
             })
             player.setVideoSurfaceView(sv)
